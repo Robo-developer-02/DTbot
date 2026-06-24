@@ -58,6 +58,17 @@
           starts and cleared in a finally block so it is always released
           even if playback crashes. capture_speech() skips energy
           detection while the flag is True.
+
+  FIX-P9  Internet connectivity check added — is_internet_available()
+          does a quick TCP socket probe to Google's public DNS (8.8.8.8:53)
+          before classifying any exception. classify_error() now uses a
+          three-tier scheme:
+            Tier 1 — no_internet : socket probe fails → internet is down.
+            Tier 2 — api_error   : internet is up but the API call failed.
+            Tier 3 — env_error   : anything else (runtime / env issue).
+          ERROR_MESSAGES carries the matching spoken English phrase for
+          each tier. announce_error() always speaks in English regardless
+          of the conversation language.
 ============================================================
 """
 
@@ -68,6 +79,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import tempfile
 import textwrap
 import time
@@ -86,14 +98,10 @@ from groq import Groq
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import edge_tts
-try:
-    import pyttsx3 as _pyttsx3_mod
-    _PYTTSX3_AVAILABLE = True
-except ImportError:
-    _PYTTSX3_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════
 #  LOGGING  (FIX-P4)
+#  Console-only — no file logging.
 #  Set LOG_LEVEL=DEBUG in your .env for verbose dev output.
 # ══════════════════════════════════════════════════════════
 
@@ -101,7 +109,6 @@ load_dotenv()
 
 _log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 _log_level = getattr(logging, _log_level_name, logging.INFO)
-_log_file = os.getenv("LOG_FILE", os.path.join("logs", "dtbot.log"))
 
 _formatter = logging.Formatter(
     fmt="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
@@ -115,17 +122,6 @@ logger.propagate = False
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_formatter)
 logger.addHandler(_console_handler)
-
-try:
-    os.makedirs(os.path.dirname(_log_file) or ".", exist_ok=True)
-    from logging.handlers import RotatingFileHandler
-    _file_handler = RotatingFileHandler(
-        _log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-    )
-    _file_handler.setFormatter(_formatter)
-    logger.addHandler(_file_handler)
-except OSError as _log_exc:
-    logger.warning("Could not set up file logging at '%s': %s", _log_file, _log_exc)
 
 
 # ══════════════════════════════════════════════════════════
@@ -145,7 +141,7 @@ logger.info("API key loaded.")
 
 STT_MODEL      = "whisper-large-v3"
 STT_MODEL_FAST = "whisper-large-v3-turbo"
-CHAT_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "openai/gpt-oss-20b"
 
 TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_HI = "hi-IN-SwaraNeural"
@@ -272,16 +268,58 @@ class State(Enum):
 
 
 # ══════════════════════════════════════════════════════════
-#  ERROR HANDLING
+#  ERROR HANDLING  (FIX-P9: three-tier classification)
+#
+#  Tier 1 — no_internet : socket probe fails → internet is down.
+#  Tier 2 — api_error   : internet is up but the API call failed.
+#  Tier 3 — env_error   : anything else (runtime / environment issue).
+#
+#  announce_error() always speaks in ENGLISH regardless of `lang`
+#  because error text is English-only; selecting the Hindi TTS voice
+#  for English text sounds garbled.
 # ══════════════════════════════════════════════════════════
 
 ERROR_MESSAGES = {
-    "api_error": {"en": "I can't connect to the server."},
-    "env_error": {"en": "Environmental error, please restart me."},
+    "no_internet": {"en": "I can't connect to the internet."},
+    "api_error":   {"en": "I can't connect to the server."},
+    "env_error":   {"en": "Environmental error, please restart me."},
 }
 
 
+def is_internet_available(
+    host: str = "8.8.8.8",
+    port: int = 53,
+    timeout: float = 3.0,
+) -> bool:
+    """
+    Quick TCP probe to Google's public DNS.
+    Returns True when a connection can be established, False otherwise.
+    Called only inside classify_error() — not on every request.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+
+
 def classify_error(exc: Exception) -> str:
+    """
+    Map an exception to one of: 'no_internet', 'api_error', 'env_error'.
+
+    Order matters:
+      1. No internet at all takes priority — even an API exception could
+         be caused by no connectivity, so we check the network first.
+      2. Internet is up but the call failed → api_error.
+      3. Everything else → env_error.
+    """
+    # ── Tier 1: connectivity probe (FIX-P9) ──────────────
+    if not is_internet_available():
+        return "no_internet"
+
+    # ── Tier 2: API / network-layer failures ──────────────
     api_related_types = (
         requests.exceptions.RequestException,
         ConnectionError,
@@ -303,10 +341,17 @@ def classify_error(exc: Exception) -> str:
        any(s in exc_msg  for s in api_signals):
         return "api_error"
 
+    # ── Tier 3: generic environment error ─────────────────
     return "env_error"
 
 
 def announce_error(exc: Exception, lang: str = "en") -> None:
+    """
+    Classify the exception and speak the appropriate English error message.
+    Always uses the English voice regardless of `lang` to avoid the Hindi
+    TTS voice mispronouncing English error text.
+    Wrapped in its own try/except so a TTS failure cannot cascade.
+    """
     try:
         kind = classify_error(exc)
         msg  = ERROR_MESSAGES[kind]["en"]
@@ -694,7 +739,7 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             # FIX-P8: ignore all energy while the bot is speaking so
             # its own voice never triggers a new recording.
             if _mic_muted:
-                idle_clock = time.time()   # reset timeout — bot is just talking
+                idle_clock = time.time()
                 continue
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))
@@ -836,7 +881,7 @@ def speak(text: str, lang: str = "en") -> None:
     try:
         if _speak_edge_tts(text, voice):
             return
-        logger.warning("edge-tts failed — attempting offline pyttsx3 fallback.")
+        logger.warning("edge-tts failed — attempting offline espeak fallback.")
         if _speak_pyttsx3(text, lang):
             return
         logger.error("All TTS engines failed for this utterance.")
@@ -885,33 +930,22 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
 
 
 def _speak_pyttsx3(text: str, lang: str) -> bool:
-    if not _PYTTSX3_AVAILABLE:
-        logger.debug("pyttsx3 not installed — offline fallback unavailable.")
-        return False
-
     try:
-        engine = _pyttsx3_mod.init()
-        voices = engine.getProperty("voices")
-        lang_tag = "hi" if lang == "hi" else "en"
-        for v in voices:
-            if lang_tag in (v.languages[0].decode() if isinstance(v.languages[0], bytes)
-                            else v.languages[0]).lower():
-                engine.setProperty("voice", v.id)
-                break
-        engine.setProperty("rate", 155)
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
+        voice = "hi" if lang == "hi" else "en"
+        subprocess.run(
+            ["espeak", "-v", voice, text],
+            check=True,
+        )
         return True
     except Exception as exc:
-        logger.error("pyttsx3 fallback error: %s", exc)
+        logger.error("espeak fallback error: %s", exc)
         return False
 
 
 def _speak_direct(text: str, voice: str) -> None:
     if _speak_edge_tts(text, voice):
         return
-    logger.warning("_speak_direct: edge-tts failed, trying pyttsx3.")
+    logger.warning("_speak_direct: edge-tts failed, trying espeak.")
     if _speak_pyttsx3(text, lang="en"):
         return
     logger.error("_speak_direct: all engines failed (giving up).")
@@ -939,8 +973,9 @@ def print_banner(rag_en_ready: bool, rag_hi_ready: bool) -> None:
         f"  STT (conversation): {STT_MODEL}  (full quality)\n"
         f"  Content filter  : ON  (max input {MAX_INPUT_CHARS} chars)\n"
         f"  Max history     : {MAX_HISTORY_TURNS} turns per language\n"
-        f"  Log level       : {_log_level_name}  |  Log file: {_log_file}\n"
+        f"  Log level       : {_log_level_name}  (console only)\n"
         f"  Mic gate        : ON  (speaker echo blocked during TTS)\n"
+        f"  Error tiers     : no_internet → api_error → env_error\n"
         f"  States          :\n"
         f"    👂 LISTENING  — always-on, auto-detects your voice\n"
         f"    😴 IDLE       — {int(IDLE_TIMEOUT)}s silence → idle\n"
@@ -1064,7 +1099,6 @@ def main() -> None:
                     continue
 
                 state = State.SPEAKING
-
                 logger.info(state_label(state))
                 speak(reply, lang)
                 state = State.LISTENING
