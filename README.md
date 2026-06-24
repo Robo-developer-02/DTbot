@@ -1,5 +1,5 @@
 # DTbot :-
-A RAG based chatbot for Acropolis College.
+A RAG based chatbot for DTown Robotics.
 
 # Features
 
