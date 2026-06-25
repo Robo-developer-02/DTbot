@@ -11,7 +11,7 @@
 
 """
 ============================================================
-  🤖  DTBot — RAG-Powered Speech-to-Speech Chatbot
+  🤖  DTBot 2.2 — RAG-Powered Speech-to-Speech Chatbot
   Production Release
 ============================================================
 
@@ -52,23 +52,19 @@
   FIX-P7  User text is sanitized (strip + collapse internal whitespace)
           before being passed to the LLM or used for logging.
 
-  FIX-P8  Mic gate (_mic_muted flag) prevents the bot's own speaker
-          output from being picked up by an always-on mic and re-triggered
-          as a new question. The flag is set True before TTS playback
-          starts and cleared in a finally block so it is always released
-          even if playback crashes. capture_speech() skips energy
-          detection while the flag is True.
+  FIX-P8  build_context() now sets source="PDF" whenever pdf_context is
+          non-empty, regardless of whether the web fallback also ran.
+          Previously, if pdf_score was below threshold and the web
+          search came back empty, source stayed "None" even though the
+          PDF context was used by the LLM to answer correctly.
 
-  FIX-P9  Internet connectivity check added — is_internet_available()
-          does a quick TCP socket probe to Google's public DNS (8.8.8.8:53)
-          before classifying any exception. classify_error() now uses a
-          three-tier scheme:
-            Tier 1 — no_internet : socket probe fails → internet is down.
-            Tier 2 — api_error   : internet is up but the API call failed.
-            Tier 3 — env_error   : anything else (runtime / env issue).
-          ERROR_MESSAGES carries the matching spoken English phrase for
-          each tier. announce_error() always speaks in English regardless
-          of the conversation language.
+  FIX-P9  transcribe() detects when Whisper outputs Urdu/Arabic script
+          for what is actually Hindi speech (a known ambiguity in the
+          model) and retries once with an explicit language="hi" hint
+          to bias toward Devanagari. Without this, the Hindi RAG index
+          (built in Devanagari) scores ~0 against an Urdu-script query
+          — zero character overlap — silently losing PDF access for
+          that turn even though the spoken intent was understood fine.
 ============================================================
 """
 
@@ -79,7 +75,6 @@ import os
 import queue
 import re
 import socket
-import subprocess
 import tempfile
 import textwrap
 import time
@@ -98,10 +93,14 @@ from groq import Groq
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import edge_tts
+try:
+    import pyttsx3 as _pyttsx3_mod
+    _PYTTSX3_AVAILABLE = True
+except ImportError:
+    _PYTTSX3_AVAILABLE = False
 
 # ══════════════════════════════════════════════════════════
 #  LOGGING  (FIX-P4)
-#  Console-only — no file logging.
 #  Set LOG_LEVEL=DEBUG in your .env for verbose dev output.
 # ══════════════════════════════════════════════════════════
 
@@ -110,18 +109,12 @@ load_dotenv()
 _log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 _log_level = getattr(logging, _log_level_name, logging.INFO)
 
-_formatter = logging.Formatter(
-    fmt="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s [%(levelname)-8s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
-
 logger = logging.getLogger("dtbot")
-logger.setLevel(_log_level)
-logger.propagate = False
-
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(_formatter)
-logger.addHandler(_console_handler)
 
 
 # ══════════════════════════════════════════════════════════
@@ -139,41 +132,34 @@ logger.info("API key loaded.")
 #  CONFIG
 # ══════════════════════════════════════════════════════════
 
-STT_MODEL      = "whisper-large-v3"
-STT_MODEL_FAST = "whisper-large-v3-turbo"
-CHAT_MODEL = "openai/gpt-oss-20b"
+STT_MODEL  = "whisper-large-v3"
+CHAT_MODEL = "openai/gpt-oss-120b"
 
 TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_HI = "hi-IN-SwaraNeural"
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16_000
 CHANNELS    = 1
 MAX_TOKENS  = 300
 
-CHAT_TEMPERATURE = float(os.getenv("CHAT_TEMPERATURE", "0.4"))
-MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "600"))
-
 # ── History ───────────────────────────────────────────────
+# FIX-P3: cap per-language history to prevent memory growth.
+# Each turn = 1 user + 1 assistant message → 2 items per turn.
 MAX_HISTORY_TURNS = 10
 MAX_HISTORY_ITEMS = MAX_HISTORY_TURNS * 2
-LLM_MAX_RETRIES   = 2
+LLM_MAX_RETRIES   = 2   # extra attempts when model returns empty response
 
 # ── RAG settings ──────────────────────────────────────────
-PDF_PATH_EN  = "/home/dt/Desktop/DTown/english_details.pdf"
-PDF_PATH_HI  = "/home/dt/Desktop/DTown/hindi_details.pdf"
-CHUNK_SIZE   = 300
-CHUNK_OVERLAP = 50
-TOP_K        = 3
-PDF_THRESHOLD = 0.04
+PDF_PATH_EN  = "C:\\Users\\Lenovo\\Desktop\\DTbot2.0\\DTown_Robotics_Report_v2.pdf"
+PDF_PATH_HI  = "C:\\Users\\Lenovo\\Desktop\\DTbot2.0\\DTown_Robotics_Report_v2_translated_hin.pdf"
+CHUNK_SIZE   = 500
+CHUNK_OVERLAP = 100
+TOP_K        = 5
+PDF_THRESHOLD = 0.10
 
 # ── Web fallback ──────────────────────────────────────────
 WEB_RESULTS = 3
 WEB_TIMEOUT = 5
-WEB_KEYWORDS = [
-    "today", "latest", "current", "now", "2025", "2026",
-    "result", "launch", "release", "price", "update",
-    "aaj", "abhi", "nayi", "naya",
-]
 
 # ── VAD tuning ────────────────────────────────────────────
 ENERGY_THRESHOLD     = 0.10
@@ -189,7 +175,7 @@ WAKE_WORDS = ["hello", "hey", "hello dtbot", "hey dtbot", "dtbot"]
 
 # ── System prompts ────────────────────────────────────────
 _BASE_EN = (
-    "Your name is DTBot. You are the official AI assistant and "
+    "Your name is DTBot 2.2. You are the official AI assistant and "
     "virtual representative of DTown Robotics (DTR), a robotics, drone "
     "and unmanned ground vehicle company headquartered in Noida, Uttar "
     "Pradesh, India. "
@@ -213,7 +199,7 @@ _BASE_EN = (
 )
 
 _BASE_HI = (
-    "Aapka naam DTBot hai. Aap DTown Robotics (DTR) ke official AI "
+    "Aapka naam DTBot 2.2 hai. Aap DTown Robotics (DTR) ke official AI "
     "assistant aur virtual representative hain, jo Noida, Uttar Pradesh, "
     "India mein headquartered ek robotics, drone aur unmanned ground "
     "vehicle company hai. "
@@ -234,7 +220,10 @@ _BASE_HI = (
     "dein. Bullet points ya markdown ka upyog na karein."
 )
 
+
 _LANG_DIRECTIVE = {
+    # Hard constraint appended to every system prompt so the model cannot
+    # mirror a foreign-language input (e.g. German "Hallo", Greek text).
     "en": (
         "IMPORTANT: You MUST reply ONLY in English, regardless of the "
         "language the user writes in. Never respond in any other language."
@@ -250,8 +239,12 @@ _LANG_DIRECTIVE = {
 def build_system(lang: str, context: str) -> str:
     base      = _BASE_HI if lang == "hi" else _BASE_EN
     directive = _LANG_DIRECTIVE.get(lang, _LANG_DIRECTIVE["en"])
+    # Language directive goes at the END so it is the last thing the
+    # model reads before generating — maximising instruction-following.
     parts = [base, directive]
     if context:
+        # Insert context between base and directive so the directive
+        # still closes the prompt.
         parts = [base, f"Use the following information silently to answer naturally.\n\n{context}", directive]
     return "\n\n".join(parts)
 
@@ -268,58 +261,17 @@ class State(Enum):
 
 
 # ══════════════════════════════════════════════════════════
-#  ERROR HANDLING  (FIX-P9: three-tier classification)
-#
-#  Tier 1 — no_internet : socket probe fails → internet is down.
-#  Tier 2 — api_error   : internet is up but the API call failed.
-#  Tier 3 — env_error   : anything else (runtime / environment issue).
-#
-#  announce_error() always speaks in ENGLISH regardless of `lang`
-#  because error text is English-only; selecting the Hindi TTS voice
-#  for English text sounds garbled.
+#  ERROR HANDLING
 # ══════════════════════════════════════════════════════════
 
 ERROR_MESSAGES = {
-    "no_internet": {"en": "I can't connect to the internet."},
-    "api_error":   {"en": "I can't connect to the server."},
-    "env_error":   {"en": "Environmental error, please restart me."},
+    "api_error": {"en": "I can't connect to the server."},
+    "env_error": {"en": "Environmental error, please restart me."},
 }
 
 
-def is_internet_available(
-    host: str = "8.8.8.8",
-    port: int = 53,
-    timeout: float = 3.0,
-) -> bool:
-    """
-    Quick TCP probe to Google's public DNS.
-    Returns True when a connection can be established, False otherwise.
-    Called only inside classify_error() — not on every request.
-    """
-    try:
-        socket.setdefaulttimeout(timeout)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.connect((host, port))
-        return True
-    except OSError:
-        return False
-
-
 def classify_error(exc: Exception) -> str:
-    """
-    Map an exception to one of: 'no_internet', 'api_error', 'env_error'.
-
-    Order matters:
-      1. No internet at all takes priority — even an API exception could
-         be caused by no connectivity, so we check the network first.
-      2. Internet is up but the call failed → api_error.
-      3. Everything else → env_error.
-    """
-    # ── Tier 1: connectivity probe (FIX-P9) ──────────────
-    if not is_internet_available():
-        return "no_internet"
-
-    # ── Tier 2: API / network-layer failures ──────────────
+    """Return 'api_error' or 'env_error' based on the exception type."""
     api_related_types = (
         requests.exceptions.RequestException,
         ConnectionError,
@@ -341,15 +293,13 @@ def classify_error(exc: Exception) -> str:
        any(s in exc_msg  for s in api_signals):
         return "api_error"
 
-    # ── Tier 3: generic environment error ─────────────────
     return "env_error"
 
 
 def announce_error(exc: Exception, lang: str = "en") -> None:
     """
     Classify the exception and speak the appropriate English error message.
-    Always uses the English voice regardless of `lang` to avoid the Hindi
-    TTS voice mispronouncing English error text.
+    Always uses the English voice regardless of the conversation language.
     Wrapped in its own try/except so a TTS failure cannot cascade.
     """
     try:
@@ -362,82 +312,23 @@ def announce_error(exc: Exception, lang: str = "en") -> None:
 
 
 # ══════════════════════════════════════════════════════════
-#  INPUT SANITIZATION
+#  INPUT SANITIZATION  (FIX-P1 / FIX-P7)
 # ══════════════════════════════════════════════════════════
 
 def sanitize_text(text: Optional[str]) -> str:
+    """
+    Strip leading/trailing whitespace and collapse internal runs of
+    whitespace to a single space.  Returns an empty string when the
+    input is None, empty, or whitespace-only.
+    """
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
 
 
 def is_blank(text: Optional[str]) -> bool:
+    """Return True when text is None, empty, or whitespace-only."""
     return not text or not text.strip()
-
-
-# ══════════════════════════════════════════════════════════
-#  CONTENT MODERATION
-# ══════════════════════════════════════════════════════════
-
-_RAW_BLOCKED_PATTERNS: List[Tuple[str, str]] = [
-    (r"\bf+u+c+k+\b",            "profanity-en"),
-    (r"\bs+h+i+t+\b",            "profanity-en"),
-    (r"\bb+i+t+c+h+\b",          "profanity-en"),
-    (r"\bass+h+o+l+e+\b",        "profanity-en"),
-    (r"\bc+u+n+t+\b",            "profanity-en"),
-    (r"\bd+i+c+k+\b",            "profanity-en"),
-    (r"\bp+u+s+s+y+\b",          "profanity-en"),
-    (r"\bn+i+g+g+\w*\b",         "slur-en"),
-    (r"\bsex\b",                 "sexual-en"),
-    (r"\bporn\w*\b",             "sexual-en"),
-    (r"\bnude\w*\b",             "sexual-en"),
-    (r"\bmadarch\w*\b",          "profanity-hi"),
-    (r"\bbhench\w*\b",           "profanity-hi"),
-    (r"\bchutiy\w*\b",           "profanity-hi"),
-    (r"\bgandu\b",               "profanity-hi"),
-    (r"\bharamz\w*\b",           "profanity-hi"),
-    (r"\bkamina\b",              "profanity-hi"),
-    (r"\blund\b",                "sexual-hi"),
-    (r"\bchut\b",                "sexual-hi"),
-    (r"\bkill\s+you\b",          "threat-en"),
-    (r"\bi\s+will\s+kill\b",     "threat-en"),
-    (r"\bbomb\b",                "threat-en"),
-    (r"\bmarunga\b",             "threat-hi"),
-    (r"\bjaan\s+se\s+marunga\b", "threat-hi"),
-    (r"\bignore\s+(all\s+)?previous\s+instructions?\b", "jailbreak"),
-    (r"\bpretend\s+(you\s+are|to\s+be)\b",               "jailbreak"),
-    (r"\bact\s+as\s+(a\s+)?different\b",                 "jailbreak"),
-    (r"\byou\s+are\s+now\s+(dan|jailbreak\w*)\b",        "jailbreak"),
-    (r"\bsystem\s*prompt\b",                             "jailbreak"),
-    (r"\bforget\s+your\s+(rules?|instructions?)\b",      "jailbreak"),
-    (r"\bdo\s+anything\s+now\b",                         "jailbreak"),
-    (r"\bno\s+restrictions?\b",                          "jailbreak"),
-]
-
-_BLOCKED_PATTERNS: List[Tuple[re.Pattern, str]] = []
-for _raw, _label in _RAW_BLOCKED_PATTERNS:
-    try:
-        _BLOCKED_PATTERNS.append((re.compile(_raw, re.IGNORECASE), _label))
-    except re.error as _re_exc:
-        logger.warning("Bad moderation pattern %r skipped: %s", _raw, _re_exc)
-
-_MODERATION_REFUSAL = {
-    "en": "I'm here to help with questions about DTown Robotics only. Please keep our conversation respectful.",
-    "hi": "Mein sirf DTown Robotics se related sawaalon mein madad karta hoon. Kripya izzat se baat karein.",
-}
-
-
-def moderate_input(text: str, lang: str) -> Optional[str]:
-    if len(text) > MAX_INPUT_CHARS:
-        logger.warning("Blocked input — too long (%d chars).", len(text))
-        return _MODERATION_REFUSAL.get(lang, _MODERATION_REFUSAL["en"])
-
-    for pattern, label in _BLOCKED_PATTERNS:
-        if pattern.search(text):
-            logger.warning("Blocked input [%s]: %r", label, text[:80])
-            return _MODERATION_REFUSAL.get(lang, _MODERATION_REFUSAL["en"])
-
-    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -470,6 +361,10 @@ class RAGEngine:
         return True
 
     def retrieve(self, query: str) -> Tuple[str, float]:
+        """
+        Retrieve the top-K relevant chunks for *query* and return
+        (context_string, best_score).  Returns ("", 0.0) when not ready.
+        """
         if not self.ready or not self.chunks:
             return "", 0.0
 
@@ -483,6 +378,8 @@ class RAGEngine:
             self.chunks[i] for i in top_idx if scores[i] > 0
         )
         return context, best_score
+
+    # ── Internal helpers ──────────────────────────────────
 
     @staticmethod
     def _extract_text(path: str) -> str:
@@ -508,6 +405,8 @@ class RAGEngine:
             sublinear_tf=True,
             min_df=1,
             max_df=0.95,
+            # token_pattern=r"\S+" keeps Devanagari words intact;
+            # the default pattern breaks on Unicode combining marks.
             token_pattern=r"\S+",
         )
         self.matrix = self.vectorizer.fit_transform(self.chunks)
@@ -516,51 +415,112 @@ class RAGEngine:
 # ══════════════════════════════════════════════════════════
 #  WEB SEARCH FALLBACK
 # ══════════════════════════════════════════════════════════
+#
+#  DuckDuckGo's Instant Answer API (api.duckduckgo.com) ONLY returns
+#  data for Wikipedia-style "knowledge panel" entities. For a normal
+#  search query (e.g. "DTown Robotics drone specs") it returns an
+#  empty AbstractText and an empty RelatedTopics list almost every
+#  time — it is not a general web search endpoint. That's why the web
+#  fallback used to come back empty even when the query was perfectly
+#  searchable.
+#
+#  Fix: try the Instant Answer API first (cheap, fast, occasionally
+#  useful), and if it returns nothing, fall back to scraping
+#  DuckDuckGo's actual HTML results page, which returns real search
+#  snippets for any query without needing an API key.
+# ══════════════════════════════════════════════════════════
+
+_DDG_HTML_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+# Matches the visible snippet text DuckDuckGo's HTML results page wraps
+# each result in: <a class="result__snippet" ...>...text...</a>
+_DDG_SNIPPET_RE = re.compile(
+    r'class="result__snippet"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _ddg_instant_answer(query: str) -> str:
+    """Try DuckDuckGo's Instant Answer API. Returns '' if nothing usable."""
+    resp = requests.get(
+        "https://api.duckduckgo.com/",
+        params={
+            "q":            query,
+            "format":       "json",
+            "no_html":      "1",
+            "skip_disambig":"1",
+        },
+        timeout=WEB_TIMEOUT,
+        headers={"User-Agent": "DTBot/2.2"},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    snippets: List[str] = []
+
+    if data.get("AbstractText"):
+        snippets.append(data["AbstractText"])
+
+    for topic in data.get("RelatedTopics", [])[:WEB_RESULTS]:
+        text = topic.get("Text", "")
+        if text:
+            snippets.append(text)
+
+    return " ".join(snippets).strip()
+
+
+def _ddg_html_search(query: str) -> str:
+    """
+    Fall back to DuckDuckGo's HTML results page and scrape the visible
+    result snippets. This is what actually behaves like "web search" —
+    the Instant Answer API does not.
+    """
+    resp = requests.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        timeout=WEB_TIMEOUT,
+        headers={"User-Agent": _DDG_HTML_UA},
+    )
+    resp.raise_for_status()
+
+    raw_snippets = _DDG_SNIPPET_RE.findall(resp.text)
+    snippets: List[str] = []
+    for raw in raw_snippets[:WEB_RESULTS]:
+        text = _HTML_TAG_RE.sub("", raw)          # strip any nested tags
+        text = sanitize_text(text)
+        if text:
+            snippets.append(text)
+
+    return " ".join(snippets).strip()
+
 
 def web_search(query: str) -> str:
     search_query = f"{query} DTown Robotics DTR Noida"
+
+    # ── Tier 1: Instant Answer API (fast, but rarely has data) ───────
     try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={
-                "q":            search_query,
-                "format":       "json",
-                "no_html":      "1",
-                "skip_disambig":"1",
-            },
-            timeout=WEB_TIMEOUT,
-            headers={"User-Agent": "DTBot"},
-        )
-        resp.raise_for_status()
-        data     = resp.json()
-        snippets: List[str] = []
-
-        if data.get("AbstractText"):
-            snippets.append(data["AbstractText"])
-
-        for topic in data.get("RelatedTopics", [])[:WEB_RESULTS]:
-            text = topic.get("Text", "")
-            if text:
-                snippets.append(text)
-
-        context = " ".join(snippets).strip()
+        context = _ddg_instant_answer(search_query)
         if context:
-            logger.debug("Web context fetched (%d chars).", len(context))
-        else:
-            logger.debug("Web search returned no usable snippets.")
-        return context
-
+            logger.debug("Web context via Instant Answer API (%d chars).", len(context))
+            return context
+        logger.debug("Instant Answer API returned nothing — trying HTML search.")
     except Exception as exc:
-        logger.warning("Web search failed: %s", exc)
+        logger.warning("Instant Answer API failed: %s", exc)
+
+    # ── Tier 2: DuckDuckGo HTML results page (real search results) ──
+    try:
+        context = _ddg_html_search(search_query)
+        if context:
+            logger.debug("Web context via HTML search (%d chars).", len(context))
+        else:
+            logger.debug("HTML search returned no usable snippets either.")
+        return context
+    except Exception as exc:
+        logger.warning("Web search failed (both tiers): %s", exc)
         announce_error(exc, "en")
         return ""
-
-
-def needs_web(query: str, score: float) -> bool:
-    q              = query.lower()
-    time_sensitive = any(kw in q for kw in WEB_KEYWORDS)
-    low_score      = score < PDF_THRESHOLD
-    return low_score and time_sensitive
 
 
 # ══════════════════════════════════════════════════════════
@@ -576,30 +536,14 @@ except Exception as _init_exc:
 
 
 # ══════════════════════════════════════════════════════════
-#  CONVERSATION HISTORY
+#  CONVERSATION HISTORY  (FIX-P3)
 # ══════════════════════════════════════════════════════════
 
 history: dict = {"en": [], "hi": []}
 
-# ══════════════════════════════════════════════════════════
-#  MIC GATE  (FIX-P8)
-#  Prevents bot's own speaker output from being re-picked-up by the mic
-#  and mistakenly treated as a new user question.
-#  • Set True in speak() BEFORE playback starts.
-#  • Cleared in a finally block so it is ALWAYS released even on crash.
-#  • Checked in capture_speech() — energy is ignored while True.
-# ══════════════════════════════════════════════════════════
-
-_mic_muted: bool = False
-
-
-def reset_session_history() -> None:
-    history["en"].clear()
-    history["hi"].clear()
-    logger.info("Session history cleared — new conversation starting.")
-
 
 def _trim_history(lang: str) -> None:
+    """Keep the history within MAX_HISTORY_ITEMS entries (oldest dropped first)."""
     lang_history = history[lang]
     if len(lang_history) > MAX_HISTORY_ITEMS:
         excess = len(lang_history) - MAX_HISTORY_ITEMS
@@ -608,10 +552,24 @@ def _trim_history(lang: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════
-#  LLM
+#  LLM  (FIX-P1, FIX-P2)
 # ══════════════════════════════════════════════════════════
 
 def get_ai_reply(user_text: str, lang: str, context: str) -> str:
+    """
+    Send *user_text* to the LLM and return the assistant's reply as a
+    non-empty string.
+
+    FIX-P1: Input is validated at the start of this function as a second
+            line of defence (the main loop already checks, but belt-and-
+            suspenders prevents a silent empty call to the API).
+
+    FIX-P2: The function now ALWAYS returns a non-empty str or raises an
+            exception.  The previous implicit None return (caused by the
+            commented-out fallback) triggered a double error announcement
+            and caused TTS to receive None.
+    """
+    # ── Input guard (FIX-P1) ──────────────────────────────
     clean_input = sanitize_text(user_text)
     if is_blank(clean_input):
         raise ValueError("get_ai_reply received empty or whitespace-only input.")
@@ -622,14 +580,16 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
     try:
         system = build_system(lang, context)
 
+        # Retry loop — the model occasionally returns an empty string on
+        # the first attempt (observed with openai/gpt-oss-20b + Hindi).
         last_exc: Optional[Exception] = None
-        for attempt in range(1, LLM_MAX_RETRIES + 2):
+        for attempt in range(1, LLM_MAX_RETRIES + 2):  # +2 → 1 normal + N retries
             try:
                 response = client.chat.completions.create(
                     model=CHAT_MODEL,
                     messages=[{"role": "system", "content": system}, *lang_history],
                     max_tokens=MAX_TOKENS,
-                    temperature=CHAT_TEMPERATURE,
+                    temperature=0.4,
                 )
                 raw_reply = response.choices[0].message.content
                 logger.debug("Raw LLM response (attempt %d): %r", attempt, raw_reply)
@@ -640,6 +600,7 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                     _trim_history(lang)
                     return reply
 
+                # Empty response — log and retry if attempts remain
                 logger.warning(
                     "LLM returned empty response on attempt %d/%d.",
                     attempt, LLM_MAX_RETRIES + 1,
@@ -652,15 +613,17 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                 logger.warning("LLM API error on attempt %d: %s", attempt, api_exc)
                 last_exc = api_exc
                 if attempt <= LLM_MAX_RETRIES:
-                    time.sleep(0.5 * attempt)
+                    time.sleep(0.5 * attempt)   # brief back-off before retry
 
+        # All attempts exhausted — roll back and raise
         lang_history.pop()
         raise last_exc or RuntimeError("LLM failed after all retry attempts.")
 
     except Exception:
+        # Roll back the user turn if it was appended before the failure.
         if lang_history and lang_history[-1]["role"] == "user":
             lang_history.pop()
-        raise
+        raise   # re-raise so the caller can handle and announce the error
 
 
 # ══════════════════════════════════════════════════════════
@@ -678,19 +641,23 @@ def build_context(
     pdf_context, pdf_score = rag.retrieve(query)
     logger.debug("PDF score: %.3f (threshold=%.2f)", pdf_score, PDF_THRESHOLD)
 
+    # Prioritize PDF. Only search web if PDF score is low.
     web_context = ""
     source      = "None"
 
-    if pdf_context and pdf_score >= PDF_THRESHOLD:
+    # FIX: `source` must reflect what is actually placed into `parts`
+    # below, not just the high-confidence branch. Previously, if
+    # pdf_score < PDF_THRESHOLD and the web search came back empty,
+    # `source` stayed "None" even though pdf_context was non-empty and
+    # WAS added to parts (and WAS used by the LLM to answer correctly).
+    if pdf_context:
         source = "PDF"
 
-    if needs_web(query, pdf_score):
+    if not pdf_context or pdf_score < PDF_THRESHOLD:
+        logger.debug("PDF score is low (or no PDF context), attempting web search.")
         web_context = web_search(query)
         if web_context:
             source = "PDF+Web" if pdf_context else "Web"
-    else:
-        if pdf_score < PDF_THRESHOLD:
-            logger.debug("Web skipped — query is not time-sensitive.")
 
     parts: List[str] = []
     if pdf_context:
@@ -702,7 +669,7 @@ def build_context(
 
 
 # ══════════════════════════════════════════════════════════
-#  VAD RECORDING  (FIX-P8: skip energy check while mic is gated)
+#  VAD RECORDING
 # ══════════════════════════════════════════════════════════
 
 def capture_speech(timeout: float) -> Optional[np.ndarray]:
@@ -734,12 +701,6 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             except queue.Empty:
                 if not recording and time.time() - idle_clock >= timeout:
                     return None
-                continue
-
-            # FIX-P8: ignore all energy while the bot is speaking so
-            # its own voice never triggers a new recording.
-            if _mic_muted:
-                idle_clock = time.time()
                 continue
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))
@@ -780,27 +741,32 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
 #  TRANSCRIBE
 # ══════════════════════════════════════════════════════════
 
-def transcribe(audio: np.ndarray) -> Tuple[str, str]:
-    return _transcribe_with_model(audio, STT_MODEL)
+def _has_devanagari(text: str) -> bool:
+    return any(0x0900 <= ord(ch) <= 0x097F for ch in text)
 
 
-def transcribe_fast(audio: np.ndarray) -> Tuple[str, str]:
-    return _transcribe_with_model(audio, STT_MODEL_FAST)
+def _has_arabic_script(text: str) -> bool:
+    return any(0x0600 <= ord(ch) <= 0x06FF for ch in text)
 
 
-def _transcribe_with_model(audio: np.ndarray, model: str) -> Tuple[str, str]:
+def _transcribe_once(audio: np.ndarray, language: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Run one Whisper transcription pass. If *language* is given, it is
+    passed as an explicit hint to the API (helps Whisper pick a script
+    when the audio is otherwise ambiguous between Hindi and Urdu).
+    """
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
         sf.write(tmp_path, audio, SAMPLE_RATE)
 
+        kwargs = dict(model=STT_MODEL, response_format="verbose_json")
+        if language:
+            kwargs["language"] = language
+
         with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="verbose_json",
-            )
+            result = client.audio.transcriptions.create(file=f, **kwargs)
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -808,7 +774,7 @@ def _transcribe_with_model(audio: np.ndarray, model: str) -> Tuple[str, str]:
             except OSError:
                 pass
 
-    text = sanitize_text(result.text)
+    text = sanitize_text(result.text)          # FIX-P7: sanitize at source
     lang = (result.language or "en").strip().lower()
 
     if lang == "ur":
@@ -816,11 +782,37 @@ def _transcribe_with_model(audio: np.ndarray, model: str) -> Tuple[str, str]:
     if lang not in ("hi", "en"):
         lang = "en"
 
-    for ch in text:
-        cp = ord(ch)
-        if 0x0900 <= cp <= 0x097F or 0x0600 <= cp <= 0x06FF:
-            lang = "hi"
-            break
+    if _has_devanagari(text) or _has_arabic_script(text):
+        lang = "hi"
+
+    return text, lang
+
+
+def transcribe(audio: np.ndarray) -> Tuple[str, str]:
+    """
+    Transcribe *audio* to (text, lang).
+
+    FIX-P9: Whisper sometimes transcribes Hindi speech using Urdu/Arabic
+    script instead of Devanagari when the audio is ambiguous. Since the
+    Hindi PDF/RAG index is built entirely in Devanagari, an Urdu-script
+    query scores ~0 against it (no character overlap at all), so the
+    bot silently loses access to the PDF for that turn even though the
+    intent and meaning were correctly understood. Detect this case and
+    retry once with an explicit language="hi" hint, which biases Whisper
+    toward Devanagari output.
+    """
+    text, lang = _transcribe_once(audio)
+
+    if lang == "hi" and _has_arabic_script(text) and not _has_devanagari(text):
+        logger.debug(
+            "Hindi speech transcribed in Urdu/Arabic script (%r) — "
+            "retrying with explicit language hint.", text
+        )
+        retry_text, retry_lang = _transcribe_once(audio, language="hi")
+        if retry_text and _has_devanagari(retry_text):
+            logger.debug("Retry succeeded with Devanagari output: %r", retry_text)
+            return retry_text, "hi"
+        logger.debug("Retry did not produce Devanagari output — keeping original.")
 
     return text, lang
 
@@ -835,9 +827,10 @@ def is_wake_word(text: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════
-#  TTS  (FIX-P5: reuse event loop | FIX-P8: mic gate)
+#  TTS  (FIX-P5: reuse a single event loop)
 # ══════════════════════════════════════════════════════════
 
+# Module-level event loop created once; reused by every speak() call.
 _tts_loop = asyncio.new_event_loop()
 
 
@@ -859,15 +852,15 @@ def speak(text: str, lang: str = "en") -> None:
     """
     Synthesise *text* and play it through speakers.
 
-    FIX-P8: _mic_muted is set True before playback and cleared in a
-    finally block so capture_speech() ignores all audio while the bot
-    is speaking — prevents speaker output from being picked up by the
-    always-on mic and re-triggered as a new user question.
-    """
-    global _mic_muted
+    Primary engine : edge-tts  (cloud, high quality)
+    Fallback engine: pyttsx3   (offline, espeak backend — no internet needed)
 
+    If both engines fail, the error is logged but never re-raised, so the
+    main loop is never crashed by a TTS failure.
+    """
     logger.debug("TTS input: %r", text)
 
+    # ── Input guard ───────────────────────────────────────
     if is_blank(text):
         logger.error("TTS input validation failed: text is empty or None.")
         fallback = ERROR_MESSAGES["env_error"]["en"]
@@ -877,19 +870,23 @@ def speak(text: str, lang: str = "en") -> None:
     voice = pick_voice(text, lang)
     logger.info("TTS [%s]: %s", voice, textwrap.shorten(text, width=80))
 
-    _mic_muted = True          # gate mic BEFORE playback (FIX-P8)
-    try:
-        if _speak_edge_tts(text, voice):
-            return
-        logger.warning("edge-tts failed — attempting offline espeak fallback.")
-        if _speak_pyttsx3(text, lang):
-            return
-        logger.error("All TTS engines failed for this utterance.")
-    finally:
-        _mic_muted = False     # ALWAYS release gate after playback (FIX-P8)
+    # ── Attempt 1: edge-tts (cloud) ───────────────────────
+    if _speak_edge_tts(text, voice):
+        return
+
+    # ── Attempt 2: pyttsx3 offline fallback ──────────────
+    logger.warning("edge-tts failed — attempting offline pyttsx3 fallback.")
+    if _speak_pyttsx3(text, lang):
+        return
+
+    logger.error("All TTS engines failed for this utterance.")
 
 
 def _speak_edge_tts(text: str, voice: str) -> bool:
+    """
+    Try to synthesise and play *text* via edge-tts.
+    Returns True on success, False on any failure.
+    """
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
@@ -930,22 +927,47 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
 
 
 def _speak_pyttsx3(text: str, lang: str) -> bool:
+    """
+    Offline TTS via pyttsx3 (espeak backend).
+    Returns True on success, False when pyttsx3 is not installed or fails.
+
+    Install on Raspberry Pi / Debian:
+        sudo apt install espeak espeak-data libespeak-dev
+        pip install pyttsx3
+    """
+    if not _PYTTSX3_AVAILABLE:
+        logger.debug("pyttsx3 not installed — offline fallback unavailable.")
+        return False
+
     try:
-        voice = "hi" if lang == "hi" else "en"
-        subprocess.run(
-            ["espeak", "-v", voice, text],
-            check=True,
-        )
+        engine = _pyttsx3_mod.init()
+        # Select a voice that matches the language when possible.
+        voices = engine.getProperty("voices")
+        lang_tag = "hi" if lang == "hi" else "en"
+        for v in voices:
+            if lang_tag in (v.languages[0].decode() if isinstance(v.languages[0], bytes)
+                            else v.languages[0]).lower():
+                engine.setProperty("voice", v.id)
+                break
+        engine.setProperty("rate", 155)   # slightly slower than default for clarity
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
         return True
     except Exception as exc:
-        logger.error("espeak fallback error: %s", exc)
+        logger.error("pyttsx3 fallback error: %s", exc)
         return False
 
 
 def _speak_direct(text: str, voice: str) -> None:
+    """
+    Minimal TTS+playback path used only by speak()'s input-validation
+    guard to announce env_error without any risk of recursion.
+    Tries edge-tts first, then pyttsx3, then gives up silently.
+    """
     if _speak_edge_tts(text, voice):
         return
-    logger.warning("_speak_direct: edge-tts failed, trying espeak.")
+    logger.warning("_speak_direct: edge-tts failed, trying pyttsx3.")
     if _speak_pyttsx3(text, lang="en"):
         return
     logger.error("_speak_direct: all engines failed (giving up).")
@@ -961,28 +983,23 @@ def print_banner(rag_en_ready: bool, rag_hi_ready: bool) -> None:
     sep = "=" * 60
     banner = (
         f"\n{sep}\n"
-        f"  DTBot 🤖  |  DTown Robotics, Noida\n"
+        f"  DTBot 2.2 🤖  |  DTown Robotics, Noida\n"
         f"{sep}\n"
         f"  RAG (EN) status : {status_en}\n"
         f"  RAG (HI) status : {status_hi}\n"
         f"  PDF (EN) path   : {PDF_PATH_EN}\n"
         f"  PDF (HI) path   : {PDF_PATH_HI}\n"
         f"  PDF threshold   : {PDF_THRESHOLD}  (below → web fallback)\n"
-        f"  Chat temperature: {CHAT_TEMPERATURE}\n"
-        f"  STT (wake word) : {STT_MODEL_FAST}  (fast)\n"
-        f"  STT (conversation): {STT_MODEL}  (full quality)\n"
-        f"  Content filter  : ON  (max input {MAX_INPUT_CHARS} chars)\n"
         f"  Max history     : {MAX_HISTORY_TURNS} turns per language\n"
-        f"  Log level       : {_log_level_name}  (console only)\n"
-        f"  Mic gate        : ON  (speaker echo blocked during TTS)\n"
-        f"  Error tiers     : no_internet → api_error → env_error\n"
+        f"  Log level       : {_log_level_name}\n"
         f"  States          :\n"
-        f"    👂 LISTENING  — always-on, auto-detects your voice\n"
+        f"    👂 LISTENING  — auto-detects your voice\n"
         f"    😴 IDLE       — {int(IDLE_TIMEOUT)}s silence → idle\n"
-        f"    🔊 SPEAKING   — mic gated, playing response\n"
+        f"    🔊 SPEAKING   — playing response\n"
         f"  Ctrl+C to quit\n"
         f"{sep}\n"
     )
+    # Banner uses print intentionally — it is startup UX, not a log event.
     print(banner)
 
 
@@ -996,7 +1013,7 @@ def state_label(state: State) -> str:
 
 
 # ══════════════════════════════════════════════════════════
-#  MAIN LOOP
+#  MAIN LOOP  (FIX-P6: reply scoped per iteration)
 # ══════════════════════════════════════════════════════════
 
 def _process_query(
@@ -1005,14 +1022,18 @@ def _process_query(
     rag_en: RAGEngine,
     rag_hi: RAGEngine,
 ) -> Optional[str]:
+    """
+    Retrieve context for *user_text* and return the LLM reply string, or
+    None on failure (error already announced inside this function).
+
+    FIX-P6: By isolating query processing in its own function, the main
+    loop never carries a stale `reply` value between iterations.
+    """
+    # ── FIX-P1: reject blank input before any API call ────
     clean = sanitize_text(user_text)
     if is_blank(clean):
         logger.warning("Ignoring blank user input (after sanitization).")
         return None
-
-    refusal = moderate_input(clean, lang)
-    if refusal:
-        return refusal
 
     logger.info("User [%s] › %s", lang.upper(), clean)
     logger.debug("Retrieving context …")
@@ -1026,7 +1047,7 @@ def _process_query(
     except Exception as exc:
         logger.error("LLM generation failed: %s", exc)
         announce_error(exc, lang)
-        return None
+        return None   # error already announced; caller must not announce again
 
     logger.info("AI   [%s] › %s", lang.upper(), reply)
     return reply
@@ -1045,7 +1066,7 @@ def main() -> None:
         state = State.LISTENING
         lang  = "hi"
 
-        speak("Hello! I am DTown Bot, your AI assistant.", lang="hi")
+        speak("Hello! I am DTown Bot, your AI assistant. ", lang="hi")
 
         while True:
 
@@ -1056,11 +1077,10 @@ def main() -> None:
                 if audio is None:
                     continue
 
-                wake_text, _ = transcribe_fast(audio)
+                wake_text, _ = transcribe(audio)
                 logger.debug("Heard (idle): %s", wake_text)
 
                 if is_wake_word(wake_text):
-                    reset_session_history()
                     state = State.LISTENING
                     speak("Haan, mein sun raha hoon.", lang="hi")
                 continue
@@ -1086,19 +1106,25 @@ def main() -> None:
                     announce_error(exc, lang)
                     continue
 
+                # FIX-P1: reject blank transcription immediately
                 if is_blank(user_text):
                     logger.debug("Blank transcription — skipping.")
                     continue
 
+                # FIX-P6: reply scoped here; no shared mutable state
                 state = State.THINKING
                 logger.info(state_label(state))
                 reply = _process_query(user_text, lang, rag_en, rag_hi)
 
                 if reply is None:
+                    # Error was already announced inside _process_query;
+                    # just go back to listening without a second announcement.
                     state = State.LISTENING
                     continue
 
                 state = State.SPEAKING
+
+                # ── SPEAKING (inline, scoped to this reply) ───────────
                 logger.info(state_label(state))
                 speak(reply, lang)
                 state = State.LISTENING
