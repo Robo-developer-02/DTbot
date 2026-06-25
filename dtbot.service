@@ -1,0 +1,37 @@
+[Unit]
+Description=DTown Bot — RAG Voice Chatbot
+# Start only after network and sound subsystem are ready
+After=network-online.target sound.target pulseaudio.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── Paths ─────────────────────────────────────────────────
+WorkingDirectory=/home/dt/Desktop/DTown
+ExecStart=/home/dt/Desktop/DTown/dtbot_env/bin/python \
+          /home/dt/Desktop/DTown/dtbot.py
+
+# ── Environment ───────────────────────────────────────────
+# Give the venv python priority in PATH
+Environment=PATH=/home/dt/Desktop/DTown/dtbot_env/bin:/usr/local/bin:/usr/bin:/bin
+# Load the project .env file (GROQ_API_KEY etc.)
+EnvironmentFile=/home/dt/Desktop/DTown/.env
+# PulseAudio runtime socket — required for pygame/sounddevice audio
+Environment=PULSE_RUNTIME_PATH=/run/user/1000/pulse
+
+# ── Restart policy ────────────────────────────────────────
+# Always restart on crash with a 5-second cooldown.
+# This makes the chatbot self-healing — if the API blips or the
+# network drops briefly, the bot restarts and comes back on its own.
+Restart=always
+RestartSec=5
+
+# ── Logging ───────────────────────────────────────────────
+# All output goes to journald — view with:
+#   journalctl --user -u dtbot.service -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
