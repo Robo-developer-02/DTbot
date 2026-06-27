@@ -2,10 +2,9 @@
 
   Additional installation for this file
   ─────────────────────────────────────────────────────────
-    To install the offline fallback on your Pi:
+    Offline TTS fallback uses espeak directly (no pyttsx3):
     ```
     sudo apt install espeak espeak-data libespeak-dev
-    pip install pyttsx3
     ```
 """
 
@@ -93,11 +92,17 @@ from groq import Groq
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import edge_tts
-try:
-    import pyttsx3 as _pyttsx3_mod
-    _PYTTSX3_AVAILABLE = True
-except ImportError:
-    _PYTTSX3_AVAILABLE = False
+import subprocess
+
+# Offline TTS: check espeak is installed once at startup rather than
+# attempting the subprocess and catching FileNotFoundError every call.
+import shutil
+_ESPEAK_AVAILABLE: bool = shutil.which("espeak") is not None
+if not _ESPEAK_AVAILABLE:
+    logging.getLogger("dtbot").warning(
+        "espeak not found — offline TTS unavailable. "
+        "Install with: sudo apt install espeak espeak-data libespeak-dev"
+    )
 
 # ══════════════════════════════════════════════════════════
 #  LOGGING  (FIX-P4)
@@ -132,42 +137,50 @@ logger.info("API key loaded.")
 #  CONFIG
 # ══════════════════════════════════════════════════════════
 
-STT_MODEL  = "whisper-large-v3"
-# CHAT_MODEL = "llama-3.3-70b-versatile"
-CHAT_MODEL = "openai/gpt-oss-20b"
+STT_MODEL      = "whisper-large-v3"        # full quality — used for conversation
+STT_MODEL_FAST = "whisper-large-v3-turbo"  # 3× faster — used for IDLE wake-word only
+CHAT_MODEL     = "openai/gpt-oss-20b"
 
 TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_HI = "hi-IN-SwaraNeural"
 
 SAMPLE_RATE = 16_000
 CHANNELS    = 1
-MAX_TOKENS  = 300
+MAX_TOKENS  = 120   # voice answers must be short; 300 was producing paragraph replies
 
 # ── History ───────────────────────────────────────────────
-# FIX-P3: cap per-language history to prevent memory growth.
-# Each turn = 1 user + 1 assistant message → 2 items per turn.
 MAX_HISTORY_TURNS = 10
 MAX_HISTORY_ITEMS = MAX_HISTORY_TURNS * 2
-LLM_MAX_RETRIES   = 2   # extra attempts when model returns empty response
+LLM_MAX_RETRIES   = 2
 
 # ── RAG settings ──────────────────────────────────────────
-PDF_PATH_EN  = "/home/dt/Desktop/DTown/english_details.pdf"
-PDF_PATH_HI  = "/home/dt/Desktop/DTown/hindi_details.pdf"
-CHUNK_SIZE   = 500
-CHUNK_OVERLAP = 100
-TOP_K        = 5
+PDF_PATH_EN   = "/home/dt/Desktop/DTown/english_details.pdf"
+PDF_PATH_HI   = "/home/dt/Desktop/DTown/hindi_details.pdf"
+CHUNK_SIZE    = 300   # smaller chunks → less context noise fed to LLM
+CHUNK_OVERLAP = 50
+TOP_K         = 3     # was 5; 3 × 300 words is enough context, keeps prompt small
 PDF_THRESHOLD = 0.10
 
 # ── Web fallback ──────────────────────────────────────────
-WEB_RESULTS = 3
-WEB_TIMEOUT = 5
+# Web search only fires when BOTH conditions are true:
+#   1. PDF score is below threshold
+#   2. The query contains a time-sensitive keyword
+# Without the keyword gate, web_search() was firing on every greeting
+# and general question, adding 3–8 seconds of network latency every turn.
+WEB_RESULTS  = 3
+WEB_TIMEOUT  = 5
+WEB_KEYWORDS = [
+    "today", "latest", "current", "now", "2025", "2026",
+    "result", "launch", "release", "price", "update",
+    "aaj", "abhi", "nayi", "naya", "kab", "kitna",
+]
 
 # ── VAD tuning ────────────────────────────────────────────
-ENERGY_THRESHOLD     = 0.10
-SILENCE_AFTER_SPEECH = 1.2
+ENERGY_THRESHOLD     = 0.010
+SILENCE_AFTER_SPEECH = 1.2   # was 1.2 — saves 0.4s per turn at end of every utterance
 PRE_ROLL_CHUNKS      = 6
 MIN_SPEECH_SECS      = 0.5
-CHUNK_SECS           = 0.1
+CHUNK_SECS           = 0.2   # was 0.1 — halves USB callback frequency; fixes retire_capture_urb
 IDLE_TIMEOUT         = 15.0
 IDLE_POLL_TIMEOUT    = 30.0
 
@@ -188,8 +201,10 @@ _BASE_EN = (
     "virtual representative of DTown Robotics, a robotics, drone "
     "and unmanned ground vehicle company headquartered in Noida, Uttar "
     "Pradesh, India. "
-    "Always give responses in Short, natural, human-like and consice"
-    "Don't go too long"
+    "RESPONSE LENGTH — CRITICAL: You are a VOICE assistant. Your reply "
+    "will be spoken aloud. Limit every response to 1–2 sentences maximum. "
+    "Never exceed 40 words. Do not elaborate unless the user explicitly "
+    "asks for more detail. "
     "Always represent DTown Robotics positively, professionally, and "
     "confidently. "
     "If users ask about another company or compare companies, briefly "
@@ -201,18 +216,17 @@ _BASE_EN = (
     "If DTown-specific information is unavailable, search the web first; "
     "if not connected to the internet, answer naturally using general "
     "knowledge when appropriate. "
-    "Do not provide more information than requested. "
-    "Give detailed explanations only when the user explicitly asks. "
     "Do not use bullet points or markdown."
 )
 
 _BASE_HI = (
     "Aapka naam DTBot hai. Aap DTown Robotics ke official AI "
-    "assistant aur virtual representative hain, jo Noida, Uttar Pradesh,"
+    "assistant aur virtual representative hain, jo Noida, Uttar Pradesh, "
     "India mein headquartered ek robotics, drone aur unmanned ground "
-    "vehicle company hai."
-    "hamesha chhote, swabhavik, insaanon jaise aur sankshipt jawab den;"
-    "bahut lamba na likhen."
+    "vehicle company hai. "
+    "JAWAB KI LAMBAI — ZAROORI: Aap ek VOICE assistant hain. Aapka jawab "
+    "bol ke sunaya jayega. Har jawab sirf 1–2 sentence mein dein. "
+    "Kabhi 40 shabdon se zyada mat likhein. "
     "Hamesha DTown Robotics ko positive, professional aur confident "
     "tarike se represent karein. Kisi doosri company ke baare mein "
     "poocha jaye ya comparison ho to short aur polite tarike se baat ko "
@@ -223,8 +237,7 @@ _BASE_HI = (
     "knowledge base ka zikr na karein jab tak user specifically na pooche. "
     "Agar DTown ke sambandhit jankari available na ho to web search karke "
     "jawab dein; agar internet connect na ho to natural jawab dein. "
-    "User detail maange tabhi vistaar se jawab "
-    "dein. Bullet points ya markdown ka upyog na karein."
+    "Bullet points ya markdown ka upyog na karein."
 )
 
 
@@ -272,13 +285,26 @@ class State(Enum):
 # ══════════════════════════════════════════════════════════
 
 ERROR_MESSAGES = {
-    "api_error": {"en": "I can't connect to the server."},
-    "env_error": {"en": "Environmental error, please restart me."},
+    "no_internet": {"en": "I can't connect to the internet."},
+    "api_error":   {"en": "I can't connect to the server."},
+    "env_error":   {"en": "Environmental error, please try again."},
 }
 
 
+def is_internet_available(host: str = "8.8.8.8", port: int = 53, timeout: float = 2.0) -> bool:
+    """Quick TCP probe — returns True when internet is reachable."""
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.create_connection((host, port))
+        return True
+    except OSError:
+        return False
+
+
 def classify_error(exc: Exception) -> str:
-    """Return 'api_error' or 'env_error' based on the exception type."""
+    """Return 'no_internet', 'api_error', or 'env_error'."""
+    if not is_internet_available():
+        return "no_internet"
     api_related_types = (
         requests.exceptions.RequestException,
         ConnectionError,
@@ -503,6 +529,18 @@ def _ddg_html_search(query: str) -> str:
     return " ".join(snippets).strip()
 
 
+def needs_web(query: str, score: float) -> bool:
+    """
+    Only hit the web when BOTH conditions are true:
+      1. PDF score is below threshold (PDF didn't have a good answer)
+      2. The query contains a time-sensitive keyword
+    Without the keyword gate, web_search() fired on every greeting and
+    general question, adding 3–8 seconds of latency to most turns.
+    """
+    q = query.lower()
+    return score < PDF_THRESHOLD and any(kw in q for kw in WEB_KEYWORDS)
+
+
 def web_search(query: str) -> str:
     search_query = f"{query} DTown Robotics DTR Noida"
 
@@ -526,7 +564,7 @@ def web_search(query: str) -> str:
         return context
     except Exception as exc:
         logger.warning("Web search failed (both tiers): %s", exc)
-        announce_error(exc, "en")
+        # Do NOT call announce_error() here — _process_query() handles it.
         return ""
 
 
@@ -597,6 +635,7 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                     messages=[{"role": "system", "content": system}, *lang_history],
                     max_tokens=MAX_TOKENS,
                     temperature=0.4,
+                    timeout=30,   # never hang forever waiting for Groq
                 )
                 raw_reply = response.choices[0].message.content
                 logger.debug("Raw LLM response (attempt %d): %r", attempt, raw_reply)
@@ -620,7 +659,9 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                 logger.warning("LLM API error on attempt %d: %s", attempt, api_exc)
                 last_exc = api_exc
                 if attempt <= LLM_MAX_RETRIES:
-                    time.sleep(0.5 * attempt)   # brief back-off before retry
+                    wait = 2 ** attempt   # 2s, 4s — handles Groq 429/503
+                    logger.info("Retrying in %ds …", wait)
+                    time.sleep(wait)
 
         # All attempts exhausted — roll back and raise
         lang_history.pop()
@@ -652,19 +693,18 @@ def build_context(
     web_context = ""
     source      = "None"
 
-    # FIX: `source` must reflect what is actually placed into `parts`
-    # below, not just the high-confidence branch. Previously, if
-    # pdf_score < PDF_THRESHOLD and the web search came back empty,
-    # `source` stayed "None" even though pdf_context was non-empty and
-    # WAS added to parts (and WAS used by the LLM to answer correctly).
+    # FIX: `source` must reflect what is actually placed into `parts` below.
     if pdf_context:
         source = "PDF"
 
-    if not pdf_context or pdf_score < PDF_THRESHOLD:
-        logger.debug("PDF score is low (or no PDF context), attempting web search.")
+    if needs_web(query, pdf_score):
+        logger.debug("Web search triggered (low PDF score + time-sensitive query).")
         web_context = web_search(query)
         if web_context:
             source = "PDF+Web" if pdf_context else "Web"
+    else:
+        if pdf_score < PDF_THRESHOLD:
+            logger.debug("Web skipped — query is not time-sensitive.")
 
     parts: List[str] = []
     if pdf_context:
@@ -748,6 +788,7 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
         channels=CHANNELS,
         dtype="float32",
         blocksize=blocksize,
+        latency="high",    # larger internal buffer absorbs USB timing jitter
         callback=callback,
     )
     stream.start()
@@ -768,6 +809,12 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
                 continue
 
             rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+            # Skip energy detection while bot is speaking — prevents its
+            # own speaker output from being picked up and re-triggered.
+            if _mic_muted:
+                idle_clock = time.time()
+                continue
 
             if rms >= ENERGY_THRESHOLD:
                 idle_clock    = time.time()
@@ -854,16 +901,8 @@ def _transcribe_once(audio: np.ndarray, language: Optional[str] = None) -> Tuple
 
 def transcribe(audio: np.ndarray) -> Tuple[str, str]:
     """
-    Transcribe *audio* to (text, lang).
-
-    FIX-P9: Whisper sometimes transcribes Hindi speech using Urdu/Arabic
-    script instead of Devanagari when the audio is ambiguous. Since the
-    Hindi PDF/RAG index is built entirely in Devanagari, an Urdu-script
-    query scores ~0 against it (no character overlap at all), so the
-    bot silently loses access to the PDF for that turn even though the
-    intent and meaning were correctly understood. Detect this case and
-    retry once with an explicit language="hi" hint, which biases Whisper
-    toward Devanagari output.
+    Full-quality transcription for conversation turns.
+    Uses whisper-large-v3 + Urdu→Hindi script retry (FIX-P9).
     """
     text, lang = _transcribe_once(audio)
 
@@ -881,6 +920,37 @@ def transcribe(audio: np.ndarray) -> Tuple[str, str]:
     return text, lang
 
 
+def transcribe_fast(audio: np.ndarray) -> Tuple[str, str]:
+    """
+    Fast transcription for IDLE wake-word detection only.
+    Uses whisper-large-v3-turbo — ~3× faster, slightly less accurate,
+    but accuracy doesn't matter for a yes/no wake-word check.
+    Raises ConnectionError immediately when offline so the IDLE handler
+    can announce the error rather than waiting 30s for a Groq timeout.
+    """
+    if not is_internet_available():
+        raise ConnectionError("No internet connection.")
+
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        sf.write(tmp_path, audio, SAMPLE_RATE)
+        with open(tmp_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model=STT_MODEL_FAST,
+                file=f,
+                response_format="verbose_json",
+            )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return sanitize_text(result.text), "en"
+
+
 # ══════════════════════════════════════════════════════════
 #  WAKE WORD
 # ══════════════════════════════════════════════════════════
@@ -893,6 +963,21 @@ def is_wake_word(text: str) -> bool:
 # ══════════════════════════════════════════════════════════
 #  TTS  (FIX-P5: reuse a single event loop)
 # ══════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════
+#  MIC GATE
+#  Prevents the bot's own speaker output from being picked up by the
+#  always-on mic and re-triggered as a new user question.
+#  Set True before TTS playback, cleared in a finally block so it is
+#  always released even if playback crashes.
+# ══════════════════════════════════════════════════════════
+
+# Cooldown timestamp for IDLE error announcements — prevents the bot from
+# repeating "I can't connect to the internet" every 30s while offline.
+_last_idle_error_time: float = 0.0
+
+_mic_muted: bool = False
+
 
 # Module-level event loop created once; reused by every speak() call.
 _tts_loop = asyncio.new_event_loop()
@@ -913,37 +998,31 @@ async def _tts_async(text: str, path: str, voice: str) -> None:
 
 
 def speak(text: str, lang: str = "en") -> None:
-    """
-    Synthesise *text* and play it through speakers.
-
-    Primary engine : edge-tts  (cloud, high quality)
-    Fallback engine: pyttsx3   (offline, espeak backend — no internet needed)
-
-    If both engines fail, the error is logged but never re-raised, so the
-    main loop is never crashed by a TTS failure.
-    """
+    global _mic_muted
     logger.debug("TTS input: %r", text)
 
-    # ── Input guard ───────────────────────────────────────
     if is_blank(text):
         logger.error("TTS input validation failed: text is empty or None.")
-        fallback = ERROR_MESSAGES["env_error"]["en"]
-        _speak_direct(fallback, TTS_VOICE_EN)
+        _speak_direct(ERROR_MESSAGES["env_error"]["en"], TTS_VOICE_EN)
         return
 
     voice = pick_voice(text, lang)
     logger.info("TTS [%s]: %s", voice, textwrap.shorten(text, width=80))
 
-    # ── Attempt 1: edge-tts (cloud) ───────────────────────
-    if _speak_edge_tts(text, voice):
-        return
-
-    # ── Attempt 2: pyttsx3 offline fallback ──────────────
-    logger.warning("edge-tts failed — attempting offline pyttsx3 fallback.")
-    if _speak_pyttsx3(text, lang):
-        return
-
-    logger.error("All TTS engines failed for this utterance.")
+    _mic_muted = True          # gate mic BEFORE playback — prevents self-triggering
+    try:
+        if not is_internet_available():
+            logger.warning("speak(): offline — skipping edge-tts, using espeak.")
+            _speak_espeak(text, lang)
+            return
+        if _speak_edge_tts(text, voice):
+            return
+        logger.warning("edge-tts failed — attempting offline espeak fallback.")
+        if _speak_espeak(text, lang):
+            return
+        logger.error("All TTS engines failed for this utterance.")
+    finally:
+        _mic_muted = False     # ALWAYS release gate after playback
 
 
 def _speak_edge_tts(text: str, voice: str) -> bool:
@@ -990,49 +1069,56 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
                 pass
 
 
-def _speak_pyttsx3(text: str, lang: str) -> bool:
+def _speak_espeak(text: str, lang: str) -> bool:
     """
-    Offline TTS via pyttsx3 (espeak backend).
-    Returns True on success, False when pyttsx3 is not installed or fails.
+    Offline TTS via espeak subprocess.
+    Tries the language-specific voice first, falls back to English.
 
-    Install on Raspberry Pi / Debian:
-        sudo apt install espeak espeak-data libespeak-dev
-        pip install pyttsx3
+    Voice selection:
+      - Hindi → tries 'hi' first, falls back to 'en' if not installed
+      - English → uses 'en' directly
+    espeak -s 140  : slightly slower than default (160) for clarity
+    espeak -a 180  : slightly louder amplitude
+    timeout=15     : hard cap so a stalled espeak can't block the bot
     """
-    if not _PYTTSX3_AVAILABLE:
-        logger.debug("pyttsx3 not installed — offline fallback unavailable.")
+    if not _ESPEAK_AVAILABLE:
+        logger.error("espeak not found — cannot speak offline.")
         return False
 
-    try:
-        engine = _pyttsx3_mod.init()
-        # Select a voice that matches the language when possible.
-        voices = engine.getProperty("voices")
-        lang_tag = "hi" if lang == "hi" else "en"
-        for v in voices:
-            if lang_tag in (v.languages[0].decode() if isinstance(v.languages[0], bytes)
-                            else v.languages[0]).lower():
-                engine.setProperty("voice", v.id)
-                break
-        engine.setProperty("rate", 155)   # slightly slower than default for clarity
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
-        return True
-    except Exception as exc:
-        logger.error("pyttsx3 fallback error: %s", exc)
-        return False
+    voices_to_try = (["hi"] if lang == "hi" else []) + ["en"]
+    for voice in voices_to_try:
+        try:
+            subprocess.run(
+                ["espeak", "-v", voice, "-s", "140", "-a", "180", text],
+                check=True,
+                timeout=15,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except subprocess.CalledProcessError:
+            logger.warning("espeak voice '%s' unavailable, trying next …", voice)
+            continue
+        except subprocess.TimeoutExpired:
+            logger.error("espeak timed out.")
+            return False
+        except Exception as exc:
+            logger.error("espeak error: %s", exc)
+            return False
+
+    logger.error("espeak: no usable voice found.")
+    return False
 
 
 def _speak_direct(text: str, voice: str) -> None:
     """
     Minimal TTS+playback path used only by speak()'s input-validation
     guard to announce env_error without any risk of recursion.
-    Tries edge-tts first, then pyttsx3, then gives up silently.
+    Tries edge-tts first, then espeak, then gives up silently.
     """
     if _speak_edge_tts(text, voice):
         return
-    logger.warning("_speak_direct: edge-tts failed, trying pyttsx3.")
-    if _speak_pyttsx3(text, lang="en"):
+    logger.warning("_speak_direct: edge-tts failed, trying espeak.")
+    if _speak_espeak(text, lang="en"):
         return
     logger.error("_speak_direct: all engines failed (giving up).")
 
@@ -1134,26 +1220,40 @@ def main() -> None:
 
         speak("Hello! I am DTown Bot, your AI assistant. ", lang="hi")
 
+        global _last_idle_error_time
         while True:
 
             # ── IDLE ──────────────────────────────────────
             if state == State.IDLE:
-                logger.info(state_label(state))
+                logger.debug(state_label(state))
                 audio = capture_speech(timeout=IDLE_POLL_TIMEOUT)
                 if audio is None:
                     continue
 
-                wake_text, _ = transcribe(audio)
+                try:
+                    wake_text, _ = transcribe_fast(audio)
+                except Exception as exc:
+                    # Announce the error (e.g. "I can't connect to the internet")
+                    # but only if enough time has passed — prevents the bot from
+                    # repeating the message every 30s while offline.
+                    now = time.time()
+                    if now - _last_idle_error_time >= 30.0:
+                        announce_error(exc, "en")
+                        _last_idle_error_time = now
+                    logger.warning("Wake-word transcription failed: %s", exc)
+                    continue
                 logger.debug("Heard (idle): %s", wake_text)
 
                 if is_wake_word(wake_text):
+                    history["en"].clear()
+                    history["hi"].clear()
                     state = State.LISTENING
                     speak("Haan, mein sun raha hoon.", lang="hi")
                 continue
 
             # ── LISTENING ─────────────────────────────────
             if state == State.LISTENING:
-                logger.info(state_label(state))
+                logger.debug(state_label(state))
                 audio = capture_speech(timeout=IDLE_TIMEOUT)
 
                 if audio is None:
@@ -1205,6 +1305,10 @@ def main() -> None:
         except Exception:
             pass
     finally:
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
         try:
             _tts_loop.close()
         except Exception:
