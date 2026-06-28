@@ -8,13 +8,15 @@
 #
 #  What this script does:
 #   [A] Boot → CLI autologin (no desktop, saves ~300MB RAM)
-#   [B] Disables SSH password login (key-only or fully off)
+#   [B] SSH left as-is (password login kept)
 #   [C] Sets a strong dt password you choose
-#   [D] Removes "dt" user from sudo group (optional, ask)
+#   [D] Keeps sudo on dt (needed for maintenance)
 #   [E] Disables Bluetooth (not needed, reduces attack surface)
-#   [F] Disables unnecessary services (cups, avahi, triggerhappy)
+#   [F] Disables unnecessary services (cups, avahi, triggerhappy, hciuart)
+#        NOTE: wpa_supplicant is NOT disabled — WiFi must stay on
 #   [G] Makes the .env file readable only by "dt" user
 #   [H] Locks the project directory permissions
+#   [I] Enables PulseAudio as user service (required for audio at boot)
 #
 #  Usage:
 #    chmod +x lockdown.sh
@@ -44,6 +46,9 @@ read -p "  Type YES to continue: " confirm
 [ "$confirm" = "YES" ] || { echo "Aborted."; exit 0; }
 
 # ── [A] Boot to CLI with autologin ────────────────────────
+# REQUIRED: autologin opens the user session that PulseAudio
+# attaches to. Without it, audio will not work at boot even
+# though the dtbot process starts via linger.
 echo ""
 echo "[A] Configuring boot to CLI with autologin..."
 
@@ -59,96 +64,41 @@ UNIT
 echo "  ✅ Boot target: CLI + autologin as '$ADMIN_USER'"
 echo "     (Desktop GUI disabled — saves ~300 MB RAM for the chatbot)"
 
-# ── [B] SSH hardening ─────────────────────────────────────
+# ── [B] SSH — left as-is with password login ──────────────
 echo ""
-echo "[B] SSH configuration..."
-echo "  Choose SSH policy:"
-echo "    1) Disable SSH completely (most secure, no remote access)"
-echo "    2) Keep SSH but only with a key (no password login)"
-echo "    3) Leave SSH as-is"
-read -p "  Enter choice [1/2/3]: " ssh_choice
-
-case "$ssh_choice" in
-    1)
-        systemctl disable ssh 2>/dev/null || true
-        systemctl stop    ssh 2>/dev/null || true
-        echo "  ✅ SSH disabled completely"
-        echo "  ⚠️  You can only access the Pi physically now."
-        echo "     To re-enable later: sudo systemctl enable --now ssh"
-        ;;
-    2)
-        if [ ! -d "/home/$ADMIN_USER/.ssh" ]; then
-            echo "  ⚠️  No ~/.ssh directory found for '$ADMIN_USER'."
-            echo "     You MUST add your public key to /home/$ADMIN_USER/.ssh/authorized_keys"
-            echo "     BEFORE disabling password auth, or you will be locked out."
-            read -p "     Have you already added your SSH key? [y/N] " key_confirm
-            [ "$key_confirm" = "y" ] || {
-                echo "  Skipping SSH hardening. Do it manually after adding your key."
-                break
-            }
-        fi
-        SSHD_CONF="/etc/ssh/sshd_config"
-        cp "$SSHD_CONF" "${SSHD_CONF}.bak"
-        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/'   "$SSHD_CONF"
-        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/'                 "$SSHD_CONF"
-        sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSHD_CONF"
-        grep -q "^PasswordAuthentication" "$SSHD_CONF" || echo "PasswordAuthentication no" >> "$SSHD_CONF"
-        systemctl restart ssh
-        echo "  ✅ SSH: password login disabled, key-only access enabled"
-        ;;
-    3)
-        echo "  ⏭  SSH left unchanged"
-        ;;
-    *)
-        echo "  Invalid choice — SSH left unchanged"
-        ;;
-esac
+echo "[B] SSH — leaving as-is (password login kept)"
+echo "  ✅ SSH unchanged — you can still connect with password over LAN"
+echo "  ⚠️  Tip: make sure your router does not expose port 22 to the internet"
 
 # ── [C] Set a strong dt password ──────────────────────────
 echo ""
 echo "[C] Setting password for user '$ADMIN_USER'..."
-echo "  Choose a strong password — this is the only way back into the system."
+echo "  Choose a strong password."
 passwd "$ADMIN_USER"
 echo "  ✅ Password updated"
 
-# ── [D] Sudo restriction (optional) ──────────────────────
+# ── [D] Sudo kept on dt ───────────────────────────────────
 echo ""
-echo "[D] Sudo access for '$ADMIN_USER'..."
-echo "  Currently '$ADMIN_USER' has full sudo access."
-echo "  For a production box, you can remove it — but you will need"
-echo "  to create a separate maintenance account for admin tasks."
-echo ""
-read -p "  Remove sudo from '$ADMIN_USER'? [y/N] " sudo_choice
-if [ "$sudo_choice" = "y" ]; then
-    read -p "  Enter name for new maintenance admin account: " MAINT_USER
-    if id "$MAINT_USER" &>/dev/null; then
-        echo "  User '$MAINT_USER' already exists — adding to sudo"
-    else
-        adduser "$MAINT_USER"
-    fi
-    usermod -aG sudo "$MAINT_USER"
-    deluser "$ADMIN_USER" sudo
-    echo "  ✅ Sudo removed from '$ADMIN_USER'"
-    echo "  ✅ '$MAINT_USER' now has sudo access"
-    echo "  ⚠️  Use '$MAINT_USER' for any future admin tasks."
-else
-    echo "  ⏭  Sudo access left unchanged for '$ADMIN_USER'"
-fi
+echo "[D] Sudo access — keeping sudo on '$ADMIN_USER'"
+echo "  ✅ Sudo unchanged — needed for reboot, apt, and maintenance over SSH"
 
 # ── [E] Disable Bluetooth ─────────────────────────────────
 echo ""
 echo "[E] Disabling Bluetooth (not needed for chatbot)..."
 systemctl disable bluetooth 2>/dev/null || true
 systemctl stop    bluetooth 2>/dev/null || true
-if ! grep -q "dtoverlay=disable-bt" /boot/config.txt 2>/dev/null && \
-   ! grep -q "dtoverlay=disable-bt" /boot/firmware/config.txt 2>/dev/null; then
-    BOOT_CFG="/boot/config.txt"
-    [ -f "/boot/firmware/config.txt" ] && BOOT_CFG="/boot/firmware/config.txt"
+
+BOOT_CFG="/boot/config.txt"
+[ -f "/boot/firmware/config.txt" ] && BOOT_CFG="/boot/firmware/config.txt"
+
+if ! grep -q "dtoverlay=disable-bt" "$BOOT_CFG" 2>/dev/null; then
     echo "dtoverlay=disable-bt" >> "$BOOT_CFG"
 fi
 echo "  ✅ Bluetooth disabled"
 
 # ── [F] Disable unnecessary services ──────────────────────
+# ⚠️  wpa_supplicant is intentionally NOT in this list.
+#     Disabling it kills WiFi, which kills Groq API calls.
 echo ""
 echo "[F] Disabling unnecessary background services..."
 
@@ -158,7 +108,6 @@ SERVICES_TO_DISABLE=(
     "avahi-daemon"
     "triggerhappy"
     "hciuart"
-    "wpa_supplicant"
 )
 
 for svc in "${SERVICES_TO_DISABLE[@]}"; do
@@ -167,9 +116,11 @@ for svc in "${SERVICES_TO_DISABLE[@]}"; do
         systemctl stop    "$svc" 2>/dev/null || true
         echo "  ✅ $svc disabled"
     else
-        echo "  ⏭  $svc not installed"
+        echo "  ⏭  $svc not installed — skipping"
     fi
 done
+
+echo "  ✅ wpa_supplicant intentionally kept — WiFi must stay on for Groq API"
 
 # ── [G] Lock down .env file ───────────────────────────────
 echo ""
@@ -177,9 +128,10 @@ echo "[G] Securing .env file (contains API key)..."
 if [ -f "$PROJECT_DIR/.env" ]; then
     chown "$ADMIN_USER:$ADMIN_USER" "$PROJECT_DIR/.env"
     chmod 600 "$PROJECT_DIR/.env"
-    echo "  ✅ .env: permissions set to 600 (owner-only)"
+    echo "  ✅ .env: permissions set to 600 (owner-only read/write)"
 else
     echo "  ⚠️  .env not found at $PROJECT_DIR — skipping"
+    echo "     Make sure it exists before running the chatbot"
 fi
 
 # ── [H] Lock project directory ────────────────────────────
@@ -189,23 +141,44 @@ chown -R "$ADMIN_USER:$ADMIN_USER" "$PROJECT_DIR"
 chmod 750 "$PROJECT_DIR"
 echo "  ✅ $PROJECT_DIR: permissions set to 750"
 
+# ── [I] Enable PulseAudio as user service ─────────────────
+# This is critical. Without PulseAudio running at boot as a
+# user service, dtbot.service will start but produce no audio.
+echo ""
+echo "[I] Enabling PulseAudio as a user service for '$ADMIN_USER'..."
+
+sudo -u "$ADMIN_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $ADMIN_USER)" \
+    systemctl --user enable pulseaudio 2>/dev/null || true
+
+sudo -u "$ADMIN_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $ADMIN_USER)" \
+    systemctl --user enable pulseaudio.socket 2>/dev/null || true
+
+echo "  ✅ PulseAudio user service enabled"
+echo "     It will start automatically when '$ADMIN_USER' session opens at boot"
+
 # ── Summary ───────────────────────────────────────────────
 echo ""
 echo "============================================================"
 echo "  Lockdown complete. Summary:"
 echo ""
 echo "  [A] Boot → CLI autologin as '$ADMIN_USER' (no desktop)"
-echo "  [B] SSH: see choice above"
+echo "      └─ Required for PulseAudio + audio at boot"
+echo "  [B] SSH: password login kept (unchanged)"
 echo "  [C] dt password: updated"
-echo "  [D] Sudo: see choice above"
+echo "  [D] Sudo: kept on '$ADMIN_USER'"
 echo "  [E] Bluetooth: disabled"
-echo "  [F] Unnecessary services: disabled"
+echo "  [F] Unnecessary services disabled (WiFi kept)"
 echo "  [G] .env: chmod 600 (API key secured)"
 echo "  [H] Project dir: chmod 750"
+echo "  [I] PulseAudio: enabled as user service"
 echo ""
-echo "  ⚠️  IMPORTANT — Reboot now to verify everything still works:"
+echo "  Boot sequence after reboot:"
+echo "    Power on → autologin as dt → PulseAudio starts"
+echo "    → dtbot.service starts → chatbot speaks ✅"
+echo ""
+echo "  ⚠️  REBOOT NOW to verify everything works:"
 echo "    sudo reboot"
 echo ""
-echo "  After reboot, verify with:"
+echo "  After reboot, check from another machine via SSH:"
 echo "    journalctl --user -u dtbot.service -n 30"
 echo "============================================================"
