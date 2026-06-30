@@ -139,7 +139,7 @@ logger.info("API key loaded.")
 
 STT_MODEL      = "whisper-large-v3"        # full quality — used for conversation
 STT_MODEL_FAST = "whisper-large-v3-turbo"  # 3× faster — used for IDLE wake-word only
-CHAT_MODEL     = "llama-3.3-70b-versatile"
+CHAT_MODEL     = "openai/gpt-oss-20b"
 
 TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_HI = "hi-IN-SwaraNeural"
@@ -259,17 +259,29 @@ _LANG_DIRECTIVE = {
 }
 
 
-def build_system(lang: str, context: str) -> str:
+def build_system(lang: str) -> str:
+    """
+    Build the SYSTEM message only.
+
+    PROMPT-CACHING NOTE: this function now returns ONLY static, never-
+    changing text (`base` + `directive`). It used to also append the
+    per-query RAG `context` here, which made the system message different
+    on every single call — that breaks prefix matching for caching, since
+    a cache hit requires the ENTIRE prefix up to that point to be byte-
+    identical to a previous request.
+
+    By keeping this function 100% static per language, the exact same
+    system string is sent on every request (for a given `lang`), so it
+    becomes a stable, reusable, cacheable prefix. The dynamic RAG context
+    is appended separately, as the LAST message in the `messages` list
+    (see `get_ai_reply`), so it can never invalidate this cached prefix.
+    """
     base      = _BASE_HI if lang == "hi" else _BASE_EN
     directive = _LANG_DIRECTIVE.get(lang, _LANG_DIRECTIVE["en"])
-    # Language directive goes at the END so it is the last thing the
-    # model reads before generating — maximising instruction-following.
-    parts = [base, directive]
-    if context:
-        # Insert context between base and directive so the directive
-        # still closes the prompt.
-        parts = [base, f"Use the following information silently to answer naturally.\n\n{context}", directive]
-    return "\n\n".join(parts)
+    # Static base prompt first, static language directive second — both
+    # are identical across every request for this language, so together
+    # they form one unbroken cacheable prefix.
+    return f"{base}\n\n{directive}"
 
 
 # ══════════════════════════════════════════════════════════
@@ -626,7 +638,25 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
     lang_history.append({"role": "user", "content": clean_input})
 
     try:
-        system = build_system(lang, context)
+        # CACHEABLE: this is the same string every time for a given lang —
+        # base prompt + language directive, no per-query content mixed in.
+        system = build_system(lang)
+
+        # NOT cacheable (changes every query): the RAG context retrieved
+        # for *this* user turn. It is appended as the LAST message below,
+        # after history, so it never sits inside — and therefore never
+        # breaks — the static system/history prefix.
+        context_msg = (
+            [{
+                "role": "system",
+                "content": (
+                    "Use the following information silently to answer naturally.\n\n"
+                    f"{context}\n\n"
+                    f"{_LANG_DIRECTIVE.get(lang, _LANG_DIRECTIVE['en'])}"
+                    ),
+            }]
+            if context else []
+        )
 
         # Retry loop — the model occasionally returns an empty string on
         # the first attempt (observed with openai/gpt-oss-20b + Hindi).
@@ -637,13 +667,33 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                 # caused by the model being "stuck" at low temperature when
                 # the prompt constraints are tight. 0.7 breaks the deadlock.
                 temp = 0.4 if attempt == 1 else 0.7
-                response = client.chat.completions.create(
+                # Prompt order for caching: [static system] [conversation
+                # history] [dynamic RAG context LAST]. Static system +
+                # history form a stable prefix Groq can cache across
+                # turns; only the trailing context message changes shape
+                # per query, so it can't invalidate the cached prefix.
+                raw_resp = client.chat.completions.with_raw_response.create(
                     model=CHAT_MODEL,
-                    messages=[{"role": "system", "content": system}, *lang_history],
+                    messages=[{"role": "system", "content": system}, *lang_history, *context_msg],
                     max_tokens=MAX_TOKENS,
                     temperature=temp,
                     timeout=30,
                 )
+                response = raw_resp.parse()
+
+                usage = response.usage
+                logger.info(
+                    "Tokens — prompt: %d | completion: %d | total: %d",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
+                )
+                h = raw_resp.headers
+                logger.info(
+                    "Limit: %s | Remaining: %s | Resets in: %s",
+                    h.get("x-ratelimit-limit-tokens"),
+                    h.get("x-ratelimit-remaining-tokens"),
+                    h.get("x-ratelimit-reset-tokens"),
+                )
+
                 raw_reply = response.choices[0].message.content
                 logger.debug("Raw LLM response (attempt %d): %r", attempt, raw_reply)
 
