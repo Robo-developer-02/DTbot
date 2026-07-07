@@ -1,69 +1,26 @@
 """
-
-  Additional installation for this file
-  ─────────────────────────────────────────────────────────
-    Offline TTS fallback uses espeak directly (no pyttsx3):
-    ```
-    sudo apt install espeak espeak-data libespeak-dev
-    ```
-"""
-
-"""
 ============================================================
-  🤖  DTBot — RAG-Powered Speech-to-Speech Chatbot
+  DTBot — RAG-Powered Speech-to-Speech Chatbot
   Production Release
 ============================================================
 
   Architecture
   ─────────────────────────────────────────────────────────
-  • Hindi queries  → retrieved directly against hindi_details.pdf (rag_hi)
+  • Hindi queries   → retrieved directly against hindi_details.pdf (rag_hi)
   • English queries → retrieved directly against english_details.pdf (rag_en)
   • Language detection picks the engine; the query is never translated.
   • Web fallback only fires when PDF score is below threshold AND the
     query contains time-sensitive keywords.
 
-  Production Changes (over dev build)
+  Additional installation
   ─────────────────────────────────────────────────────────
-  FIX-P1  Empty / whitespace-only user input is rejected BEFORE reaching
-          the LLM — validated with .strip() at both the main-loop level
-          and inside get_ai_reply() as a second defence layer.
+    Offline TTS fallback uses espeak directly (no pyttsx3):
+    ```
+    sudo apt install espeak espeak-data libespeak-dev
+    ```
 
-  FIX-P2  get_ai_reply() now ALWAYS returns a non-empty str or raises.
-          The previously commented-out fallback return was the root cause
-          of implicit None returns, which then triggered a double error
-          announcement (once inside get_ai_reply, once in SPEAKING state).
-
-  FIX-P3  Conversation history is capped at MAX_HISTORY_TURNS to prevent
-          unbounded memory growth in long sessions.
-
-  FIX-P4  All print() calls replaced with the stdlib logging module.
-          DEBUG-level messages (raw LLM response, MP3 size, TTS input)
-          are hidden in production (INFO level). Set LOG_LEVEL=DEBUG in
-          .env or environment to re-enable them during development.
-
-  FIX-P5  asyncio event loop is created once at module start and reused
-          by every speak() call, avoiding per-call loop creation overhead.
-
-  FIX-P6  The main loop's `reply` variable is scoped per iteration via a
-          helper function so no stale reply from a previous turn can bleed
-          into the SPEAKING state.
-
-  FIX-P7  User text is sanitized (strip + collapse internal whitespace)
-          before being passed to the LLM or used for logging.
-
-  FIX-P8  build_context() now sets source="PDF" whenever pdf_context is
-          non-empty, regardless of whether the web fallback also ran.
-          Previously, if pdf_score was below threshold and the web
-          search came back empty, source stayed "None" even though the
-          PDF context was used by the LLM to answer correctly.
-
-  FIX-P9  transcribe() detects when Whisper outputs Urdu/Arabic script
-          for what is actually Hindi speech (a known ambiguity in the
-          model) and retries once with an explicit language="hi" hint
-          to bias toward Devanagari. Without this, the Hindi RAG index
-          (built in Devanagari) scores ~0 against an Urdu-script query
-          — zero character overlap — silently losing PDF access for
-          that turn even though the spoken intent was understood fine.
+  See CHANGELOG.md for the history of fixes made to reach this
+  production build (FIX-P1..P9).
 ============================================================
 """
 
@@ -77,6 +34,7 @@ import socket
 import tempfile
 import textwrap
 import time
+from collections import OrderedDict
 from enum import Enum
 from functools import lru_cache
 from typing import List, Optional, Tuple
@@ -122,6 +80,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dtbot")
 
+# MODIFY: Even with LOG_LEVEL=DEBUG (for our own dtbot logs), the groq
+# SDK's internal HTTP client (httpx/httpcore) logs full request/response
+# dumps — headers, rate-limit info, etc. — at DEBUG level, which is pure
+# noise here. Force those loggers to WARNING regardless of our own level.
+for _noisy_logger in ("groq", "groq._base_client", "httpx", "httpcore"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
+
 
 # ══════════════════════════════════════════════════════════
 #  API KEY
@@ -141,13 +106,14 @@ logger.info("API key loaded.")
 STT_MODEL      = "whisper-large-v3"        # full quality — used for conversation
 STT_MODEL_FAST = "whisper-large-v3-turbo"  # 3× faster — used for IDLE wake-word only
 CHAT_MODEL     = "openai/gpt-oss-120b"
+MODEL_CONTEXT_LIMIT = 131_072   # combined prompt+completion tokens for this model on Groq
 
 TTS_VOICE_EN = "en-US-JennyNeural"
 TTS_VOICE_HI = "hi-IN-SwaraNeural"
 
 SAMPLE_RATE = 16_000
 CHANNELS    = 1
-MAX_TOKENS  = 320   # gpt-oss-20b is a reasoning model — it spends tokens on
+MAX_TOKENS  = 250   # gpt-oss-120b is a reasoning model — it spends tokens on
                      # internal chain-of-thought before the visible answer.
                      # 120 was too tight: on longer RAG-context prompts the
                      # model could burn the whole budget on reasoning and
@@ -174,6 +140,37 @@ MAX_HISTORY_ITEMS = MAX_HISTORY_TURNS * 2
 #                  very rare.
 LLM_API_MAX_RETRIES   = 2
 LLM_EMPTY_MAX_RETRIES = 4
+
+# FALLBACK_REPLY: spoken when the LLM is still empty after every retry.
+# This is NOT a server/API error (the API call itself succeeded — it just
+# returned no visible text), so it must never be routed through
+# announce_error()/ERROR_MESSAGES, which would falsely tell the user the
+# server or internet is down when it isn't.
+FALLBACK_REPLY = "Sorry, I couldn't generate a response. Could you please ask again?"
+
+# ── Response cache ────────────────────────────────────────
+# Simple in-memory LRU keyed on (sanitized query, lang). Repeated questions
+# (greetings, FAQs) skip RAG + the LLM call entirely — the biggest latency
+# win available without touching the RAG/LLM architecture. OrderedDict is
+# stdlib, so no new dependency; capped size keeps memory bounded on the Pi.
+RESPONSE_CACHE_MAX_SIZE = 200
+
+# ── Reliability timeouts (watchdog) ────────────────────────
+# Bounds on individual slow components so one hung call (bad USB audio,
+# a stalled Groq/edge-tts connection) can't freeze the whole bot forever.
+# Web search already had WEB_TIMEOUT; these cover the other three.
+STT_TIMEOUT_SECS = 20   # Groq transcription call
+LLM_TIMEOUT_SECS = 30   # Groq chat completion call (was hardcoded 30 inline)
+TTS_TIMEOUT_SECS = 15   # edge-tts synthesis (network call)
+
+# ── Max recording duration ────────────────────────────────
+# Hard ceiling on a single utterance so a stuck-open mic, background
+# noise, or a user who keeps talking can't record forever and delay
+# processing indefinitely.
+MAX_RECORDING_SECS = 20.0
+
+# ── Health logging ─────────────────────────────────────────
+HEALTH_LOG_INTERVAL = 60.0   # seconds between CPU/RAM/temp/internet log lines
 
 # ── RAG settings ──────────────────────────────────────────
 PDF_PATH_EN   = "/home/dt/Desktop/DTown/Regard_Network_Solutions_Knowledge_Base_EN.pdf"
@@ -215,7 +212,7 @@ IDLE_POLL_TIMEOUT    = 30.0
 # speaking), and clamped to a sane min/max range.
 NOISE_EMA_ALPHA       = 0.05   # smoothing factor — higher = adapts to noise faster
 THRESHOLD_MULTIPLIER  = 3.0    # speech must exceed (noise floor × this) to trigger
-DYNAMIC_THRESHOLD_MIN = 0.03   # floor — never require less than this even in silence
+DYNAMIC_THRESHOLD_MIN = 0.012   # floor — never require less than this even in silence
 DYNAMIC_THRESHOLD_MAX = 0.35   # ceiling — never require more than this even in loud rooms
 
 # ── Microphone selection ──────────────────────────────────
@@ -232,44 +229,49 @@ WAKE_WORDS = ["hello", "hey", "hello dtbot", "hey dtbot", "dtbot"]
 # ── System prompts ────────────────────────────────────────
 _BASE_EN = (
     "Your name is DTBot. You are the official AI assistant and "
-    "virtual representative of DTown Robotics, a robotics, drone "
-    "and unmanned ground vehicle company headquartered in Noida, Uttar "
-    "Pradesh, India. "
+    "virtual representative of Regard Network Solutions Ltd., a premier "
+    "turnkey system integration company headquartered in Delhi NCR, India, "
+    "specializing in end-to-end data centre build, enterprise networking, "
+    "industrial building management systems, intelligent electronic "
+    "manufacturing (at our Noida facility), and advanced surveillance "
+    "frameworks. "
     "RESPONSE LENGTH — CRITICAL: You are a VOICE assistant. Your reply "
     "will be spoken aloud. Limit every response to 1–2 sentences maximum. "
     "Never exceed 40 words. Do not elaborate unless the user explicitly "
     "asks for more detail. "
-    "Always represent DTown Robotics positively, professionally, and "
+    "Always represent Regard Network Solutions positively, professionally, and "
     "confidently. "
     "If users ask about another company or compare companies, briefly "
-    "and politely redirect the conversation toward DTown Robotics, "
-    "highlight DTown's strengths, and do not make negative comments or "
+    "and politely redirect the conversation toward Regard Network Solutions, "
+    "highlight Regard Network Solutions' strengths, and do not make negative comments or "
     "false claims about other companies. "
     "Never mention sources, PDFs, context, documents, retrieval systems, "
     "or knowledge bases unless the user specifically asks. "
-    "If DTown-specific information is unavailable, search the web first; "
+    "If Regard Network Solutions-specific information is unavailable, search the web first; "
     "if not connected to the internet, answer naturally using general "
     "knowledge when appropriate. "
     "Do not use bullet points or markdown."
 )
-
 _BASE_HI = (
-    "Aapka naam DTBot hai. Aap DTown Robotics ke official AI "
-    "assistant aur virtual representative hain, jo Noida, Uttar Pradesh, "
-    "India mein headquartered ek robotics, drone aur unmanned ground "
-    "vehicle company hai. "
+    "Aapka naam DTBot hai. Aap Regard Network Solutions Ltd. ke official "
+    "AI assistant aur virtual representative hain, jo Delhi NCR, India mein "
+    "headquartered ek premier turnkey system integration company hai, "
+    "jo end-to-end data centre build, enterprise networking, industrial "
+    "building management systems, intelligent electronic manufacturing "
+    "(Noida plant mein) aur advanced surveillance frameworks mein "
+    "specialize karti hai. "
     "JAWAB KI LAMBAI — ZAROORI: Aap ek VOICE assistant hain. Aapka jawab "
     "bol ke sunaya jayega. Har jawab sirf 1–2 sentence mein dein. "
     "Kabhi 40 shabdon se zyada mat likhein. "
-    "Hamesha DTown Robotics ko positive, professional aur confident "
+    "Hamesha Regard Network Solutions ko positive, professional aur confident "
     "tarike se represent karein. Kisi doosri company ke baare mein "
     "poocha jaye ya comparison ho to short aur polite tarike se baat ko "
-    "DTown Robotics ki taraf le jaayein, iski strengths highlight "
+    "Regard Network Solutions ki taraf le jaayein, iski strengths highlight "
     "karein, aur kisi company ke baare mein negative ya false claims na "
     "karein. "
     "Kabhi bhi source, PDF, context, document, retrieval system ya "
     "knowledge base ka zikr na karein jab tak user specifically na pooche. "
-    "Agar DTown ke sambandhit jankari available na ho to web search karke "
+    "Agar Regard Network Solutions ke sambandhit jankari available na ho to web search karke "
     "jawab dein; agar internet connect na ho to natural jawab dein. "
     "Bullet points ya markdown ka upyog na karein."
 )
@@ -295,22 +297,16 @@ def build_system(lang: str) -> str:
     """
     Static system prompt ONLY — no RAG/web context.
 
-    PROMPT CACHING (same technique as acrobot.py's FIX-A6): this string
-    never changes for a given `lang` during the process lifetime, so
-    it's memoized with @lru_cache instead of being rebuilt/re-joined on
-    every single request — maxsize=4 comfortably covers "en"/"hi" plus
-    headroom.
+    PROMPT CACHING: this string never changes for a given `lang` during
+    the process lifetime, so it's memoized with @lru_cache instead of
+    being rebuilt/re-joined on every single request — maxsize=4
+    comfortably covers "en"/"hi" plus headroom.
 
-    This goes a step further than acrobot.py, though: acrobot still
-    splices RAG context into the middle of this string per call (which
-    means the actual prompt sent to Groq changes every turn regardless
-    of the Python-level memoization — no real prefix-cache benefit on
-    Groq's side). Here, context is NEVER mixed into the system prompt;
-    it's appended to the trailing user turn instead (see
-    _build_turn_content() and get_ai_reply()). That means the system
-    prompt AND the prior-turns prefix stay byte-identical across calls,
-    so Groq's own prompt cache can also hit on the growing prefix, not
-    just our local Python object.
+    Context is NEVER mixed into the system prompt; it's appended to the
+    trailing user turn instead (see _build_turn_content() and
+    get_ai_reply()). That means the system prompt AND the prior-turns
+    prefix stay byte-identical across calls, so Groq's own prompt cache
+    can hit on the growing prefix too, not just our local Python object.
     """
     base      = _BASE_HI if lang == "hi" else _BASE_EN
     directive = _LANG_DIRECTIVE.get(lang, _LANG_DIRECTIVE["en"])
@@ -353,21 +349,74 @@ class State(Enum):
 #  ERROR HANDLING
 # ══════════════════════════════════════════════════════════
 
+# Only English is used for error announcements — see announce_error().
 ERROR_MESSAGES = {
-    "no_internet": {"en": "I can't connect to the internet."},
-    "api_error":   {"en": "I can't connect to the server."},
-    "env_error":   {"en": "Environmental error, please try again."},
+    "no_internet": "I can't connect to the internet.",
+    "api_error":   "I can't connect to the server.",
+    "env_error":   "Environmental error, please try again.",
 }
 
 
 def is_internet_available(host: str = "8.8.8.8", port: int = 53, timeout: float = 2.0) -> bool:
-    """Quick TCP probe — returns True when internet is reachable."""
+    """
+    Quick TCP probe — returns True when internet is reachable.
+
+    NOTE: timeout is passed directly to create_connection() rather than
+    via socket.setdefaulttimeout(), which would mutate the process-wide
+    default socket timeout and affect every other socket/requests call
+    in the app for the rest of the program's life.
+    """
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.create_connection((host, port))
+        socket.create_connection((host, port), timeout=timeout)
         return True
     except OSError:
         return False
+
+
+_last_health_log_time: float = 0.0
+
+
+def log_health() -> None:
+    """
+    Log CPU load, RAM usage, CPU temperature, and internet status.
+    Self-throttled to once per HEALTH_LOG_INTERVAL — safe to call from a
+    hot loop (e.g. every audio chunk in capture_speech()), since it's a
+    no-op until the interval has elapsed. Uses only stdlib (/proc, /sys,
+    os.getloadavg) rather than psutil, per the "no new dependencies"
+    constraint.
+    """
+    global _last_health_log_time
+    now = time.time()
+    if now - _last_health_log_time < HEALTH_LOG_INTERVAL:
+        return
+    _last_health_log_time = now
+
+    try:
+        load1, _, _ = os.getloadavg()   # 1-minute load average, stands in for "CPU usage"
+    except (OSError, AttributeError):
+        load1 = -1.0
+
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = f.read()
+        total  = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1))
+        avail  = int(re.search(r"MemAvailable:\s+(\d+)", meminfo).group(1))
+        ram_pct = 100.0 * (1 - avail / total)
+    except Exception:
+        ram_pct = -1.0
+
+    try:
+        # Raspberry Pi OS exposes SoC temperature here, in millidegrees C.
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            cpu_temp = int(f.read().strip()) / 1000.0
+    except Exception:
+        cpu_temp = -1.0   # not available on this platform
+
+    net_ok = is_internet_available()
+    logger.info(
+        "HEALTH load1min=%.2f ram_used=%.1f%% cpu_temp=%.1fC internet=%s",
+        load1, ram_pct, cpu_temp, "up" if net_ok else "down",
+    )
 
 
 def classify_error(exc: Exception) -> str:
@@ -398,15 +447,16 @@ def classify_error(exc: Exception) -> str:
     return "env_error"
 
 
-def announce_error(exc: Exception, lang: str = "en") -> None:
+def announce_error(exc: Exception) -> None:
     """
     Classify the exception and speak the appropriate English error message.
-    Always uses the English voice regardless of the conversation language.
+    Always uses the English voice regardless of the conversation language
+    (error messages are English-only — see ERROR_MESSAGES).
     Wrapped in its own try/except so a TTS failure cannot cascade.
     """
     try:
         kind = classify_error(exc)
-        msg  = ERROR_MESSAGES[kind]["en"]
+        msg  = ERROR_MESSAGES[kind]
         logger.warning("Announcing error (%s): %s", kind, msg)
         speak(msg, lang="en")
     except Exception as report_exc:
@@ -673,8 +723,77 @@ def _trim_history(lang: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════
-#  LLM  (FIX-P1, FIX-P2)
+#  RESPONSE CACHE
+#  Simple in-memory LRU: key = sanitized query + lang, value = reply.
+#  OrderedDict gives O(1) LRU via move_to_end()/popitem(last=False) —
+#  no new dependency, no separate class needed for something this small.
 # ══════════════════════════════════════════════════════════
+
+_response_cache: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _cache_key(query: str, lang: str) -> str:
+    return f"{lang}:{sanitize_text(query).lower()}"
+
+
+def cache_get(query: str, lang: str) -> Optional[str]:
+    key = _cache_key(query, lang)
+    if key not in _response_cache:
+        return None
+    _response_cache.move_to_end(key)   # mark as recently used
+    return _response_cache[key]
+
+
+def cache_set(query: str, lang: str, reply: str) -> None:
+    # Never cache empty replies or the spoken fallback — those aren't
+    # real answers and would just serve stale non-answers on repeat.
+    if is_blank(reply) or reply == FALLBACK_REPLY:
+        return
+    key = _cache_key(query, lang)
+    _response_cache[key] = reply
+    _response_cache.move_to_end(key)
+    if len(_response_cache) > RESPONSE_CACHE_MAX_SIZE:
+        _response_cache.popitem(last=False)   # evict least-recently-used
+
+
+# ══════════════════════════════════════════════════════════
+#  TOKEN USAGE
+# ══════════════════════════════════════════════════════════
+
+def log_token_usage(response) -> None:
+    """
+    Log prompt / completion / total tokens for this call, and how much
+    of the model's context window remains. Groq returns this in
+    `response.usage` on every chat completion — no extra API call needed.
+    Wrapped defensively since `usage` shape can vary by SDK version.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        logger.debug("No usage data on response — skipping token log.")
+        return
+
+    prompt_tokens     = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens       = getattr(usage, "total_tokens", None)
+
+    if total_tokens is None:
+        return
+
+    remaining = MODEL_CONTEXT_LIMIT - total_tokens
+    logger.info(
+        "Tokens — prompt: %s | completion: %s | total: %s | remaining of %s: %s (%.1f%% used)",
+        prompt_tokens, completion_tokens, total_tokens,
+        MODEL_CONTEXT_LIMIT, remaining,
+        100 * total_tokens / MODEL_CONTEXT_LIMIT,
+    )
+
+    if remaining < 0.1 * MODEL_CONTEXT_LIMIT:
+        logger.warning(
+            "Context window is over 90%% used (%s/%s tokens) — "
+            "consider trimming MAX_HISTORY_TURNS.",
+            total_tokens, MODEL_CONTEXT_LIMIT,
+        )
+
 
 def get_ai_reply(user_text: str, lang: str, context: str) -> str:
     """
@@ -689,6 +808,12 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
             exception.  The previous implicit None return (caused by the
             commented-out fallback) triggered a double error announcement
             and caused TTS to receive None.
+
+    Guaranteed fallback: if every empty-reply retry is exhausted, this
+    returns FALLBACK_REPLY instead of raising — the API call succeeded,
+    it just never produced visible text, so that is not a real error
+    and must not be announced as one (see the empty_exhausted branch
+    below).
     """
     # ── Input guard (FIX-P1) ──────────────────────────────
     clean_input = sanitize_text(user_text)
@@ -714,8 +839,9 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
             "content": _build_turn_content(clean_input, context),
         })
 
-        api_retries   = 0
-        empty_retries = 0
+        api_retries    = 0
+        empty_retries  = 0
+        empty_exhausted = False   # True only when we ran out of EMPTY_REPLY retries (not a real API error)
         last_exc: Optional[Exception] = None
 
         while True:
@@ -725,8 +851,8 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                     messages=api_messages,
                     max_tokens=MAX_TOKENS,
                     temperature=0.4,
-                    timeout=30,   # never hang forever waiting for Groq
-                    # gpt-oss-20b is a reasoning model: by default
+                    timeout=LLM_TIMEOUT_SECS,   # never hang forever waiting for Groq
+                    # gpt-oss-120b is a reasoning model: by default
                     # (reasoning_effort="medium") it can spend its
                     # ENTIRE max_tokens budget on internal chain-of-
                     # thought and get cut off before writing any
@@ -738,7 +864,11 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                     reasoning_effort="low",
                 )
                 raw_reply = response.choices[0].message.content
-                logger.debug("Raw LLM response: %r", raw_reply)
+                # MODIFY: dropped the "Raw LLM response" debug print — it
+                # duplicated info already visible in the "AI [..] > .." log
+                # line below and cluttered DEBUG output. Token usage is
+                # still logged via log_token_usage().
+                log_token_usage(response)
 
                 reply = sanitize_text(raw_reply)
                 if not is_blank(reply):
@@ -759,10 +889,8 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                     "LLM returned empty response (empty attempt %d/%d) — retrying immediately.",
                     empty_retries, LLM_EMPTY_MAX_RETRIES,
                 )
-                last_exc = RuntimeError(
-                    f"LLM returned an empty response after {empty_retries} empty attempt(s)."
-                )
                 if empty_retries >= LLM_EMPTY_MAX_RETRIES:
+                    empty_exhausted = True
                     break
                 # Small stagger (not a full backoff) — firing the retry
                 # with zero delay was itself dense enough to trip Groq's
@@ -782,7 +910,22 @@ def get_ai_reply(user_text: str, lang: str, context: str) -> str:
                 logger.info("Retrying in %ds …", wait)
                 time.sleep(wait)
 
-        # All attempts exhausted — roll back and raise
+        # Change 1 (guaranteed spoken fallback): if we only ran out of
+        # EMPTY_REPLY retries, the API call itself was fine — there was
+        # no real error. Returning a natural fallback line here (instead
+        # of raising) means the caller speaks it normally instead of
+        # routing through announce_error(), which would falsely tell the
+        # user the server/internet is down when it isn't.
+        if empty_exhausted:
+            logger.warning(
+                "LLM empty after %d attempts — speaking fallback instead of raising.",
+                empty_retries,
+            )
+            lang_history.pop()   # drop the user turn; no real assistant reply to pair it with
+            return FALLBACK_REPLY
+
+        # Otherwise a genuine API error persisted — roll back and raise
+        # so the caller announces a real error.
         lang_history.pop()
         raise last_exc or RuntimeError("LLM failed after all retry attempts.")
 
@@ -821,9 +964,8 @@ def build_context(
         web_context = web_search(query)
         if web_context:
             source = "PDF+Web" if pdf_context else "Web"
-    else:
-        if pdf_score < PDF_THRESHOLD:
-            logger.debug("Web skipped — query is not time-sensitive.")
+    elif pdf_score < PDF_THRESHOLD:
+        logger.debug("Web skipped — query is not time-sensitive.")
 
     parts: List[str] = []
     if pdf_context:
@@ -922,11 +1064,14 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
     speech_buffer: List[np.ndarray]   = []
     pre_buffer:    List[np.ndarray]   = []
     recording                          = False
+    recording_start: Optional[float]  = None   # Change 2: when the current utterance started
     silence_start: Optional[float]    = None
     idle_clock                         = time.time()
 
     try:
         while True:
+            log_health()   # Change 5: no-ops internally unless HEALTH_LOG_INTERVAL has passed
+
             try:
                 chunk = audio_q.get(timeout=0.5)
             except queue.Empty:
@@ -941,6 +1086,7 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             if _mic_muted:
                 idle_clock = time.time()
                 continue
+            
 
             # ── Dynamic threshold: update the ambient noise floor ──
             # Only while NOT recording an utterance — updating during
@@ -959,8 +1105,9 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
                 idle_clock    = time.time()
                 silence_start = None
                 if not recording:
-                    recording     = True
-                    speech_buffer = list(pre_buffer)
+                    recording       = True
+                    recording_start = time.time()   # Change 2: start the max-duration clock
+                    speech_buffer   = list(pre_buffer)
                 speech_buffer.append(chunk)
 
             elif recording:
@@ -977,6 +1124,16 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
                 if time.time() - idle_clock >= timeout:
                     return None
 
+            # Change 2 (max recording timeout): hard ceiling so a stuck-open
+            # mic or a user who keeps talking can't record forever — stop
+            # and process whatever has been captured so far.
+            if recording and time.time() - recording_start >= MAX_RECORDING_SECS:
+                logger.warning(
+                    "Max recording duration (%.0fs) reached — stopping capture.",
+                    MAX_RECORDING_SECS,
+                )
+                break
+
     finally:
         stream.stop()
         stream.close()
@@ -990,6 +1147,19 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
 # ══════════════════════════════════════════════════════════
 #  TRANSCRIBE
 # ══════════════════════════════════════════════════════════
+
+def _cleanup_tmp_file(path: Optional[str]) -> None:
+    """
+    Best-effort removal of a temp WAV/MP3 file. Shared by every TTS/STT
+    call site (Change 7) instead of repeating the same
+    try/os.path.exists/unlink block in each function.
+    """
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
 
 def _has_devanagari(text: str) -> bool:
     return any(0x0900 <= ord(ch) <= 0x097F for ch in text)
@@ -1016,13 +1186,11 @@ def _transcribe_once(audio: np.ndarray, language: Optional[str] = None) -> Tuple
             kwargs["language"] = language
 
         with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(file=f, **kwargs)
+            # Change 6 (watchdog): bound the Groq call so a stalled STT
+            # request can't hang the bot forever.
+            result = client.audio.transcriptions.create(file=f, timeout=STT_TIMEOUT_SECS, **kwargs)
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        _cleanup_tmp_file(tmp_path)   # Change 7
 
     text = sanitize_text(result.text)          # FIX-P7: sanitize at source
     lang = (result.language or "en").strip().lower()
@@ -1076,17 +1244,15 @@ def transcribe_fast(audio: np.ndarray) -> Tuple[str, str]:
             tmp_path = tmp.name
         sf.write(tmp_path, audio, SAMPLE_RATE)
         with open(tmp_path, "rb") as f:
+            # Change 6 (watchdog): same STT timeout as the main transcribe path.
             result = client.audio.transcriptions.create(
                 model=STT_MODEL_FAST,
                 file=f,
                 response_format="verbose_json",
+                timeout=STT_TIMEOUT_SECS,
             )
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        _cleanup_tmp_file(tmp_path)   # Change 7
     return sanitize_text(result.text), "en"
 
 
@@ -1117,6 +1283,11 @@ _last_idle_error_time: float = 0.0
 
 _mic_muted: bool = False
 
+# Change 4 (latency logging): filled by _speak_edge_tts()/_speak_espeak()
+# each time speak() runs, then read by main()'s per-turn latency log line.
+# Reset at the top of speak() so a failed call doesn't report stale numbers.
+_last_tts_timing: dict = {"gen": 0.0, "playback": 0.0}
+
 
 # Module-level event loop created once; reused by every speak() call.
 _tts_loop = asyncio.new_event_loop()
@@ -1140,9 +1311,12 @@ def speak(text: str, lang: str = "en") -> None:
     global _mic_muted
     logger.debug("TTS input: %r", text)
 
+    _last_tts_timing["gen"] = 0.0        # Change 4: reset before each call
+    _last_tts_timing["playback"] = 0.0
+
     if is_blank(text):
         logger.error("TTS input validation failed: text is empty or None.")
-        _speak_direct(ERROR_MESSAGES["env_error"]["en"], TTS_VOICE_EN)
+        _speak_direct(ERROR_MESSAGES["env_error"], TTS_VOICE_EN)
         return
 
     voice = pick_voice(text, lang)
@@ -1174,7 +1348,15 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp_path = tmp.name
 
-        _tts_loop.run_until_complete(_tts_async(text, tmp_path, voice))
+        # Change 6 (watchdog): bound the network synthesis call so a
+        # stalled edge-tts connection can't hang the bot forever — falls
+        # through to the except block below (then the espeak fallback)
+        # just like any other edge-tts failure.
+        t0 = time.time()
+        _tts_loop.run_until_complete(
+            asyncio.wait_for(_tts_async(text, tmp_path, voice), timeout=TTS_TIMEOUT_SECS)
+        )
+        _last_tts_timing["gen"] = time.time() - t0   # Change 4
 
         if not os.path.exists(tmp_path):
             raise RuntimeError("edge-tts did not create output file.")
@@ -1189,11 +1371,13 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
         except Exception as load_exc:
             raise RuntimeError(f"pygame failed to load MP3: {load_exc}") from load_exc
 
+        t0 = time.time()
         pygame.mixer.music.play()
         while pygame.mixer.music.get_busy():
             pygame.time.wait(100)
         pygame.mixer.music.stop()
         pygame.mixer.music.unload()
+        _last_tts_timing["playback"] = time.time() - t0   # Change 4
         return True
 
     except Exception as exc:
@@ -1201,11 +1385,7 @@ def _speak_edge_tts(text: str, voice: str) -> bool:
         return False
 
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        _cleanup_tmp_file(tmp_path)   # Change 7: shared cleanup helper
 
 
 def _speak_espeak(text: str, lang: str) -> bool:
@@ -1227,12 +1407,17 @@ def _speak_espeak(text: str, lang: str) -> bool:
     voices_to_try = (["hi"] if lang == "hi" else []) + ["en"]
     for voice in voices_to_try:
         try:
+            t0 = time.time()
             subprocess.run(
                 ["espeak", "-v", voice, "-s", "140", "-a", "180", text],
                 check=True,
                 timeout=15,
                 stderr=subprocess.DEVNULL,
             )
+            # espeak does synthesis + playback in one blocking call, so this
+            # rare offline-fallback path can't split gen/playback further —
+            # attribute the whole thing to "gen" for the latency log.
+            _last_tts_timing["gen"] = time.time() - t0
             return True
         except subprocess.CalledProcessError:
             logger.warning("espeak voice '%s' unavailable, trying next …", voice)
@@ -1314,6 +1499,7 @@ def _process_query(
     lang: str,
     rag_en: RAGEngine,
     rag_hi: RAGEngine,
+    timings: Optional[dict] = None,
 ) -> Optional[str]:
     """
     Retrieve context for *user_text* and return the LLM reply string, or
@@ -1321,7 +1507,13 @@ def _process_query(
 
     FIX-P6: By isolating query processing in its own function, the main
     loop never carries a stale `reply` value between iterations.
+
+    *timings*, if given, is filled in-place with 'rag' and 'llm' elapsed
+    seconds for the latency log in main() (Change 4).
     """
+    if timings is None:
+        timings = {}
+
     # ── FIX-P1: reject blank input before any API call ────
     clean = sanitize_text(user_text)
     if is_blank(clean):
@@ -1329,18 +1521,40 @@ def _process_query(
         return None
 
     logger.info("User [%s] › %s", lang.upper(), clean)
-    logger.debug("Retrieving context …")
 
+    # Change 3 (response cache): skip RAG + the LLM call entirely on a
+    # repeated question. Still recorded in conversation history so later
+    # turns keep natural continuity.
+    cached = cache_get(clean, lang)
+    if cached is not None:
+        logger.info("Cache hit — skipping RAG + LLM call.")
+        timings["rag"] = 0.0
+        timings["llm"] = 0.0
+        lang_history = history[lang]
+        lang_history.append({"role": "user", "content": clean})
+        lang_history.append({"role": "assistant", "content": cached})
+        _trim_history(lang)
+        logger.info("AI   [%s] › %s", lang.upper(), cached)
+        return cached
+
+    logger.debug("Retrieving context …")
+    t0 = time.time()
     context, source = build_context(clean, lang, rag_en, rag_hi)
+    timings["rag"] = time.time() - t0
     logger.info("Source: %s", source)
     logger.debug("Generating reply …")
 
+    t0 = time.time()
     try:
         reply = get_ai_reply(clean, lang, context)
     except Exception as exc:
+        timings["llm"] = time.time() - t0
         logger.error("LLM generation failed: %s", exc)
-        announce_error(exc, lang)
+        announce_error(exc)
         return None   # error already announced; caller must not announce again
+    timings["llm"] = time.time() - t0
+
+    cache_set(clean, lang, reply)   # Change 3: store for next time (skips empty/fallback replies)
 
     logger.info("AI   [%s] › %s", lang.upper(), reply)
     return reply
@@ -1359,7 +1573,7 @@ def main() -> None:
         state = State.LISTENING
         lang  = "hi"
 
-        speak("Hello! I am DTown Bot, your AI assistant. ", lang="hi")
+        speak("Hello! I am DTbot, your AI assistant. ", lang="hi")
 
         global _last_idle_error_time
         while True:
@@ -1379,7 +1593,7 @@ def main() -> None:
                     # repeating the message every 30s while offline.
                     now = time.time()
                     if now - _last_idle_error_time >= 30.0:
-                        announce_error(exc, "en")
+                        announce_error(exc)
                         _last_idle_error_time = now
                     logger.warning("Wake-word transcription failed: %s", exc)
                     continue
@@ -1395,7 +1609,11 @@ def main() -> None:
             # ── LISTENING ─────────────────────────────────
             if state == State.LISTENING:
                 logger.debug(state_label(state))
+                turn_start = time.time()   # Change 4: total end-to-end timer for this turn
+
+                t0 = time.time()
                 audio = capture_speech(timeout=IDLE_TIMEOUT)
+                capture_time = time.time() - t0
 
                 if audio is None:
                     state = State.IDLE
@@ -1406,12 +1624,14 @@ def main() -> None:
                     )
                     continue
 
+                t0 = time.time()
                 try:
                     user_text, lang = transcribe(audio)
                 except Exception as exc:
                     logger.error("Transcription failed: %s", exc)
-                    announce_error(exc, lang)
+                    announce_error(exc)
                     continue
+                stt_time = time.time() - t0
 
                 # FIX-P1: reject blank transcription immediately
                 if is_blank(user_text):
@@ -1421,7 +1641,8 @@ def main() -> None:
                 # FIX-P6: reply scoped here; no shared mutable state
                 state = State.THINKING
                 logger.info(state_label(state))
-                reply = _process_query(user_text, lang, rag_en, rag_hi)
+                timings: dict = {}
+                reply = _process_query(user_text, lang, rag_en, rag_hi, timings)
 
                 if reply is None:
                     # Error was already announced inside _process_query;
@@ -1434,6 +1655,20 @@ def main() -> None:
                 # ── SPEAKING (inline, scoped to this reply) ───────────
                 logger.info(state_label(state))
                 speak(reply, lang)
+
+                # Change 4: one simple combined latency line per turn.
+                # TTS gen/playback come from _last_tts_timing, filled by
+                # speak() -> _speak_edge_tts()/_speak_espeak() just above.
+                total_time = time.time() - turn_start
+                logger.info(
+                    "LATENCY capture=%.2fs stt=%.2fs rag=%.2fs llm=%.2fs "
+                    "tts_gen=%.2fs playback=%.2fs total=%.2fs",
+                    capture_time, stt_time,
+                    timings.get("rag", 0.0), timings.get("llm", 0.0),
+                    _last_tts_timing["gen"], _last_tts_timing["playback"],
+                    total_time,
+                )
+
                 state = State.LISTENING
                 continue
 
@@ -1442,7 +1677,7 @@ def main() -> None:
     except Exception as exc:
         logger.critical("Fatal error in main loop: %s", exc, exc_info=True)
         try:
-            announce_error(exc, "en")
+            announce_error(exc)
         except Exception:
             pass
     finally:
