@@ -1031,7 +1031,6 @@ def resolve_mic_device(name: str) -> Optional[str]:
 # Resolve once at module load so startup errors are caught immediately.
 _MIC_DEVICE: Optional[str] = resolve_mic_device(MIC_NAME)
 
-
 # ══════════════════════════════════════════════════════════
 #  VAD RECORDING
 # ══════════════════════════════════════════════════════════
@@ -1086,7 +1085,7 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             if _mic_muted:
                 idle_clock = time.time()
                 continue
-            
+            logger.info("MIC DEBUG rms=%.4f floor=%.4f", rms, _noise_floor)
 
             # ── Dynamic threshold: update the ambient noise floor ──
             # Only while NOT recording an utterance — updating during
