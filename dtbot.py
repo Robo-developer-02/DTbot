@@ -1,4 +1,7 @@
 """
+============CODE BEFORE MOVEMENT THROUGH VOICE==============
+THIS IS THE CODE WHICH WAS BEING USED BEFORE THE GPIO PINS WERE USED TO MOVE 
+
 ============================================================
   DTBot — RAG-Powered Speech-to-Speech Chatbot
   Production Release
