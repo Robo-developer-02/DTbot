@@ -1,4 +1,7 @@
 """
+=======THIS CODE MOVES ACCORDING TO THE USERS COMMAND=====
+
+
 ============================================================
   DTBot — RAG-Powered Speech-to-Speech Chatbot
   Production Release
