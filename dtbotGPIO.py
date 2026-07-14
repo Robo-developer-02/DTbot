@@ -1,7 +1,4 @@
 """
-=======THIS CODE MOVES ACCORDING TO THE USERS COMMAND=====
-
-
 ============================================================
   DTBot — RAG-Powered Speech-to-Speech Chatbot
   Production Release
@@ -58,15 +55,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 import edge_tts
 import subprocess
 
-# Movement control (GPIO). Wrapped in try/except so the rest of the bot
-# (RAG, TTS, STT, etc.) still runs fine on non-Pi dev machines where
-# RPi.GPIO isn't installed / no GPIO hardware is present.
+# Movement control — commands are sent to an ESP32 (jumper-wired UART:
+# Pi TX -> ESP32 RX, Pi RX -> ESP32 TX, common GND) which drives the
+# motors itself. Wrapped in try/except so the rest of the bot (RAG,
+# TTS, STT, etc.) still runs fine on dev machines without pyserial
+# installed or without the ESP32 connected.
 try:
-    import RPi.GPIO as GPIO
-    _GPIO_AVAILABLE = True
-except (ImportError, RuntimeError):
-    GPIO = None
-    _GPIO_AVAILABLE = False
+    import serial
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    _SERIAL_AVAILABLE = False
 
 # Offline TTS: check espeak is installed once at startup rather than
 # attempting the subprocess and catching FileNotFoundError every call.
@@ -308,36 +307,42 @@ _LANG_DIRECTIVE = {
 
 
 # ══════════════════════════════════════════════════════════
-#  MOVEMENT / GPIO CONTROL
+#  MOVEMENT / ESP32 MOTOR CONTROL
 # ══════════════════════════════════════════════════════════
 #
 #  Adds physical movement support (front / back / left / right) on top
-#  of the existing chatbot. Direction pins are driven via RPi.GPIO in
-#  BCM numbering. This section is fully self-contained and does not
-#  touch RAG, TTS, STT, history, or caching.
+#  of the existing chatbot. The motors are wired to an ESP32, not the
+#  Pi's own GPIO pins — the Pi talks to the ESP32 over a jumper-wired
+#  UART link (Pi TX -> ESP32 RX, Pi RX -> ESP32 TX, common GND) and the
+#  ESP32's own firmware toggles its GPIO pins in response. This section
+#  is fully self-contained and does not touch RAG, TTS, STT, history,
+#  or caching.
 #
 #  Movement model:
-#    • front / back  → drive that pin HIGH for the requested duration.
+#    • front / back  → tell the ESP32 to drive that motor for the
+#      requested duration.
 #    • left / right  → these are TURNS, not lateral holds. A "move
 #      right for 3 seconds" request pivots right for a short fixed
 #      pulse (TURN_PULSE_DURATION), then drives FRONT for the
 #      requested duration — i.e. "turn right, then go ahead for 3s".
+#
+#  Serial protocol (adjust to match the ESP32 sketch): each command is
+#  a newline-terminated ASCII line, e.g. "FRONT_ON\n", "FRONT_OFF\n",
+#  "STOP\n". The ESP32 is expected to map these directly onto its own
+#  motor driver pins.
 
-# BCM pin numbers — adjust to match actual wiring.
-PIN_FRONT = 17
-PIN_BACK = 27
-PIN_LEFT = 22
-PIN_RIGHT = 23
+ESP32_SERIAL_PORT = "/dev/serial0"  # jumper-wired UART; use /dev/ttyUSB0 if using a USB-serial adapter instead
+ESP32_BAUD_RATE = 115200
 
-_DIRECTION_PINS = {
-    "front": PIN_FRONT,
-    "back": PIN_BACK,
-    "left": PIN_LEFT,
-    "right": PIN_RIGHT,
+_DIRECTION_COMMANDS = {
+    "front": "FRONT",
+    "back": "BACK",
+    "left": "LEFT",
+    "right": "RIGHT",
 }
 
-# left/right are pivot-only pins — a request in that direction always
-# resolves to a short turn followed by a forward run.
+# left/right are pivot-only commands — a request in that direction
+# always resolves to a short turn followed by a forward run.
 _TURN_DIRECTIONS = ("left", "right")
 
 # Fixed pulse length for the pivot phase of a turn. Not user-controlled.
@@ -348,33 +353,52 @@ TURN_PULSE_DURATION = 0.5  # seconds
 # (the turn pulse above is separate and always short).
 MAX_MOVE_DURATION = 5  # seconds
 
-if _GPIO_AVAILABLE:
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    for _pin in _DIRECTION_PINS.values():
-        GPIO.setup(_pin, GPIO.OUT)
-        GPIO.output(_pin, GPIO.LOW)
+_esp32: Optional["serial.Serial"] = None
+if _SERIAL_AVAILABLE:
+    try:
+        _esp32 = serial.Serial(ESP32_SERIAL_PORT, ESP32_BAUD_RATE, timeout=1)
+        time.sleep(2)  # give the ESP32 a moment to reset after the port opens
+        logger.info(
+            "Connected to ESP32 over serial (%s @ %d baud).",
+            ESP32_SERIAL_PORT, ESP32_BAUD_RATE,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not open serial connection to ESP32 (%s) — movement "
+            "commands will be logged only, no motors will move: %s",
+            ESP32_SERIAL_PORT, exc,
+        )
+        _esp32 = None
 else:
     logger.warning(
-        "RPi.GPIO not available — movement commands will be logged only "
-        "(no physical pin output)."
+        "pyserial not installed — movement commands will be logged only. "
+        "Install with: pip install pyserial"
     )
 
 
-def _gpio_cleanup() -> None:
-    """Release all GPIO pins on interpreter exit so nothing is left
-    driving a motor after the process ends."""
-    if not _GPIO_AVAILABLE:
+def _send_to_esp32(command: str) -> None:
+    """Send a single newline-terminated command line to the ESP32."""
+    if _esp32 is None:
         return
     try:
-        for pin in _DIRECTION_PINS.values():
-            GPIO.output(pin, GPIO.LOW)
-        GPIO.cleanup()
+        _esp32.write(f"{command}\n".encode("utf-8"))
     except Exception as exc:
-        logger.warning("GPIO cleanup on exit failed: %s", exc)
+        logger.warning("Failed to send '%s' to ESP32: %s", command, exc)
 
 
-atexit.register(_gpio_cleanup)
+def _esp32_cleanup() -> None:
+    """Tell the ESP32 to stop and close the serial port on exit so
+    nothing is left driving a motor after the process ends."""
+    if _esp32 is None:
+        return
+    try:
+        _send_to_esp32("STOP")
+        _esp32.close()
+    except Exception as exc:
+        logger.warning("ESP32 serial cleanup on exit failed: %s", exc)
+
+
+atexit.register(_esp32_cleanup)
 
 # Synonym map → canonical direction. Includes English + Hindi/Hinglish
 # phrasing so voice commands are recognized regardless of which
@@ -433,17 +457,14 @@ _move_lock = threading.Lock()
 
 
 def stop() -> None:
-    """Set all direction pins LOW (halt all movement)."""
-    if not _GPIO_AVAILABLE:
-        return
-    for pin in _DIRECTION_PINS.values():
-        GPIO.output(pin, GPIO.LOW)
+    """Tell the ESP32 to turn all direction outputs off (halt all movement)."""
+    _send_to_esp32("STOP")
 
 
 def stop_movement() -> None:
     """
-    Immediately interrupt any in-progress move() call and set all pins
-    LOW. Safe to call even if nothing is currently moving.
+    Immediately interrupt any in-progress move() call and tell the
+    ESP32 to stop. Safe to call even if nothing is currently moving.
     """
     _move_stop_event.set()
     stop()
@@ -461,11 +482,10 @@ def _sleep_interruptible(duration: float) -> None:
 
 
 def _drive(direction: str, seconds: float, label: str) -> None:
-    """Drive a single pin HIGH for *seconds*, print status, then LOW."""
-    pin = _DIRECTION_PINS[direction]
+    """Tell the ESP32 to run one motor for *seconds*, print status, then stop."""
+    command = _DIRECTION_COMMANDS[direction]
     stop()
-    if _GPIO_AVAILABLE:
-        GPIO.output(pin, GPIO.HIGH)
+    _send_to_esp32(f"{command}_ON")
     print(f"Moving {label} for {seconds} seconds")
     _sleep_interruptible(seconds)
     stop()
@@ -505,7 +525,7 @@ def move(direction: str, duration: float) -> None:
     global _move_thread
 
     direction = direction.lower().strip()
-    if direction not in _DIRECTION_PINS:
+    if direction not in _DIRECTION_COMMANDS:
         logger.warning("move() called with unknown direction: %s", direction)
         return
 
@@ -1354,7 +1374,7 @@ _noise_floor: float = ENERGY_THRESHOLD
 # Throttles the "MIC DEBUG rms=..." log line to once per second instead
 # of once per audio chunk (which fired ~5x/second at CHUNK_SECS≈0.2s).
 _last_mic_debug_log: float = 0.0
-MIC_DEBUG_LOG_INTERVAL = 0.5  # seconds
+MIC_DEBUG_LOG_INTERVAL = 1.0  # seconds
 
 
 def capture_speech(timeout: float) -> Optional[np.ndarray]:
