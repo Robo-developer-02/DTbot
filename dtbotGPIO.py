@@ -326,20 +326,26 @@ _LANG_DIRECTIVE = {
 #      pulse (TURN_PULSE_DURATION), then drives FRONT for the
 #      requested duration — i.e. "turn right, then go ahead for 3s".
 #
-#  Serial protocol (adjust to match the ESP32 sketch): each command is
-#  a newline-terminated ASCII line, e.g. "FRONT_ON\n", "FRONT_OFF\n",
-#  "STOP\n". The ESP32 is expected to map these directly onto its own
-#  motor driver pins.
+#  Serial protocol (matches the ESP32 sketch's Serial2 RPi-command
+#  parser): each command is a newline-terminated ASCII line of the form
+#  "<dir>,<seconds>\n", e.g. "F,3\n" (front, 3s), "L,0\n" (left — the
+#  ESP32 ignores the number for turns and always pulses for its own
+#  fixed defaultTurnTime), "S,0\n" (stop). dir is one of F/B/L/R/S.
+#  The ESP32 owns the actual motor timing/soft-start/auto-stop once it
+#  receives a command — Python just needs to send the right line.
 
 ESP32_SERIAL_PORT = "/dev/serial0"  # jumper-wired UART; use /dev/ttyUSB0 if using a USB-serial adapter instead
 ESP32_BAUD_RATE = 115200
 
 _DIRECTION_COMMANDS = {
-    "front": "FRONT",
-    "back": "BACK",
-    "left": "LEFT",
-    "right": "RIGHT",
+    "front": "F",
+    "back": "B",
+    "left": "L",
+    "right": "R",
 }
+
+# Stop character the ESP32 sketch matches in its command switch.
+_STOP_COMMAND = "S"
 
 # left/right are pivot-only commands — a request in that direction
 # always resolves to a short turn followed by a forward run.
@@ -376,14 +382,19 @@ else:
     )
 
 
-def _send_to_esp32(command: str) -> None:
-    """Send a single newline-terminated command line to the ESP32."""
+def _send_to_esp32(direction: str, seconds: int = 0) -> None:
+    """Send a '<direction>,<seconds>' newline-terminated line to the
+    ESP32, matching its Serial2 command parser (charAt(0) = direction,
+    substring(2) = whole seconds). *direction* must be one of
+    F/B/L/R/S. For turns (L/R) and stop (S) the ESP32 ignores the
+    seconds value, so 0 is fine there."""
     if _esp32 is None:
         return
+    line = f"{direction},{int(seconds)}\n"
     try:
-        _esp32.write(f"{command}\n".encode("utf-8"))
+        _esp32.write(line.encode("utf-8"))
     except Exception as exc:
-        logger.warning("Failed to send '%s' to ESP32: %s", command, exc)
+        logger.warning("Failed to send '%s' to ESP32: %s", line.strip(), exc)
 
 
 def _esp32_cleanup() -> None:
@@ -392,7 +403,7 @@ def _esp32_cleanup() -> None:
     if _esp32 is None:
         return
     try:
-        _send_to_esp32("STOP")
+        stop()
         _esp32.close()
     except Exception as exc:
         logger.warning("ESP32 serial cleanup on exit failed: %s", exc)
@@ -458,7 +469,7 @@ _move_lock = threading.Lock()
 
 def stop() -> None:
     """Tell the ESP32 to turn all direction outputs off (halt all movement)."""
-    _send_to_esp32("STOP")
+    _send_to_esp32(_STOP_COMMAND, 0)
 
 
 def stop_movement() -> None:
@@ -482,10 +493,15 @@ def _sleep_interruptible(duration: float) -> None:
 
 
 def _drive(direction: str, seconds: float, label: str) -> None:
-    """Tell the ESP32 to run one motor for *seconds*, print status, then stop."""
+    """Tell the ESP32 to run one motor for *seconds*, print status, then
+    stop. The ESP32 itself owns the soft-start ramp and auto-stop timer
+    once it gets the command — we just send the single line with the
+    whole-second duration (turns ignore this number on the ESP32 side
+    and always use its own fixed pulse) and sleep here so this call
+    blocks for the same span. The trailing stop() is a safety net in
+    case our sleep and the ESP32's own timer drift apart."""
     command = _DIRECTION_COMMANDS[direction]
-    stop()
-    _send_to_esp32(f"{command}_ON")
+    _send_to_esp32(command, max(1, round(seconds)))
     print(f"Moving {label} for {seconds} seconds")
     _sleep_interruptible(seconds)
     stop()
