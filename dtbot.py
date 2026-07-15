@@ -1,6 +1,6 @@
 """
-============CODE BEFORE MOVEMENT THROUGH VOICE==============
-THIS IS THE CODE WHICH WAS BEING USED BEFORE THE GPIO PINS WERE USED TO MOVE 
+THIS CODE ONLY GIVES THE MESSAGE THAT IT IS MOVING , BUT ACTUALLY DOESN'T MOVE . 
+
 
 ============================================================
   DTBot — RAG-Powered Speech-to-Speech Chatbot
@@ -29,6 +29,7 @@ THIS IS THE CODE WHICH WAS BEING USED BEFORE THE GPIO PINS WERE USED TO MOVE
 
 # ── Standard library ──────────────────────────────────────
 import asyncio
+import atexit
 import logging
 import os
 import queue
@@ -36,6 +37,7 @@ import re
 import socket
 import tempfile
 import textwrap
+import threading
 import time
 from collections import OrderedDict
 from enum import Enum
@@ -55,6 +57,18 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import edge_tts
 import subprocess
+
+# Movement control — commands are sent to an ESP32 (jumper-wired UART:
+# Pi TX -> ESP32 RX, Pi RX -> ESP32 TX, common GND) which drives the
+# motors itself. Wrapped in try/except so the rest of the bot (RAG,
+# TTS, STT, etc.) still runs fine on dev machines without pyserial
+# installed or without the ESP32 connected.
+try:
+    import serial
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    _SERIAL_AVAILABLE = False
 
 # Offline TTS: check espeak is installed once at startup rather than
 # attempting the subprocess and catching FileNotFoundError every call.
@@ -215,7 +229,7 @@ IDLE_POLL_TIMEOUT    = 30.0
 # speaking), and clamped to a sane min/max range.
 NOISE_EMA_ALPHA       = 0.05   # smoothing factor — higher = adapts to noise faster
 THRESHOLD_MULTIPLIER  = 3.0    # speech must exceed (noise floor × this) to trigger
-DYNAMIC_THRESHOLD_MIN = 0.012   # floor — never require less than this even in silence
+DYNAMIC_THRESHOLD_MIN = 0.09   # floor — never require less than this even in silence
 DYNAMIC_THRESHOLD_MAX = 0.35   # ceiling — never require more than this even in loud rooms
 
 # ── Microphone selection ──────────────────────────────────
@@ -293,6 +307,339 @@ _LANG_DIRECTIVE = {
         "Kabhi bhi kisi aur bhasha mein jawab na dein."
     ),
 }
+
+
+# ══════════════════════════════════════════════════════════
+#  MOVEMENT / ESP32 MOTOR CONTROL
+# ══════════════════════════════════════════════════════════
+#
+#  Adds physical movement support (front / back / left / right) on top
+#  of the existing chatbot. The motors are wired to an ESP32, not the
+#  Pi's own GPIO pins — the Pi talks to the ESP32 over a jumper-wired
+#  UART link (Pi TX -> ESP32 RX, Pi RX -> ESP32 TX, common GND) and the
+#  ESP32's own firmware toggles its GPIO pins in response. This section
+#  is fully self-contained and does not touch RAG, TTS, STT, history,
+#  or caching.
+#
+#  Movement model:
+#    • front / back  → tell the ESP32 to drive that motor for the
+#      requested duration.
+#    • left / right  → these are TURNS, not lateral holds. A "move
+#      right for 3 seconds" request pivots right for a short fixed
+#      pulse (TURN_PULSE_DURATION), then drives FRONT for the
+#      requested duration — i.e. "turn right, then go ahead for 3s".
+#
+#  Serial protocol (matches the ESP32 sketch's Serial2 RPi-command
+#  parser): each command is a newline-terminated ASCII line of the form
+#  "<dir>,<seconds>\n", e.g. "F,3\n" (front, 3s), "L,0\n" (left — the
+#  ESP32 ignores the number for turns and always pulses for its own
+#  fixed defaultTurnTime), "S,0\n" (stop). dir is one of F/B/L/R/S.
+#  The ESP32 owns the actual motor timing/soft-start/auto-stop once it
+#  receives a command — Python just needs to send the right line.
+
+ESP32_SERIAL_PORT = "/dev/serial0"  # jumper-wired UART; use /dev/ttyUSB0 if using a USB-serial adapter instead
+ESP32_BAUD_RATE = 115200
+
+_DIRECTION_COMMANDS = {
+    "front": "F",
+    "back": "B",
+    "left": "L",
+    "right": "R",
+}
+
+# Stop character the ESP32 sketch matches in its command switch.
+_STOP_COMMAND = "S"
+
+# left/right are pivot-only commands — a request in that direction
+# always resolves to a short turn followed by a forward run.
+_TURN_DIRECTIONS = ("left", "right")
+
+# Fixed pulse length for the pivot phase of a turn. Not user-controlled.
+TURN_PULSE_DURATION = 0.5  # seconds
+
+# Safety cap: no single movement command may run longer than this, no
+# matter what the user asks for. Applies to the forward/back run length
+# (the turn pulse above is separate and always short).
+MAX_MOVE_DURATION = 5  # seconds
+
+_esp32: Optional["serial.Serial"] = None
+if _SERIAL_AVAILABLE:
+    try:
+        _esp32 = serial.Serial(ESP32_SERIAL_PORT, ESP32_BAUD_RATE, timeout=1)
+        time.sleep(2)  # give the ESP32 a moment to reset after the port opens
+        logger.info(
+            "Connected to ESP32 over serial (%s @ %d baud).",
+            ESP32_SERIAL_PORT, ESP32_BAUD_RATE,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not open serial connection to ESP32 (%s) — movement "
+            "commands will be logged only, no motors will move: %s",
+            ESP32_SERIAL_PORT, exc,
+        )
+        _esp32 = None
+else:
+    logger.warning(
+        "pyserial not installed — movement commands will be logged only. "
+        "Install with: pip install pyserial"
+    )
+
+
+def _send_to_esp32(direction: str, seconds: int = 0) -> None:
+    """Send a '<direction>,<seconds>' newline-terminated line to the
+    ESP32, matching its Serial2 command parser (charAt(0) = direction,
+    substring(2) = whole seconds). *direction* must be one of
+    F/B/L/R/S. For turns (L/R) and stop (S) the ESP32 ignores the
+    seconds value, so 0 is fine there."""
+    if _esp32 is None:
+        return
+    line = f"{direction},{int(seconds)}\n"
+    try:
+        _esp32.write(line.encode("utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to send '%s' to ESP32: %s", line.strip(), exc)
+
+
+def _esp32_cleanup() -> None:
+    """Tell the ESP32 to stop and close the serial port on exit so
+    nothing is left driving a motor after the process ends."""
+    if _esp32 is None:
+        return
+    try:
+        stop()
+        _esp32.close()
+    except Exception as exc:
+        logger.warning("ESP32 serial cleanup on exit failed: %s", exc)
+
+
+atexit.register(_esp32_cleanup)
+
+# Synonym map → canonical direction. Includes English + Hindi/Hinglish
+# phrasing so voice commands are recognized regardless of which
+# language the user is speaking (matches transcribe()'s "en"/"hi" tags).
+_DIRECTION_SYNONYMS = {
+    "front": [
+        "move ahead", "go ahead", "go forward", "forward", "ahead", "straight",
+        "आगे बढ़ो", "आगे जाओ", "आगे चलो", "सीधे चलो", "सीधा जाओ", "फॉरवर्ड", "आगे",
+    ],
+    "back": [
+        "move back", "go back", "backward", "reverse",
+        "पीछे हटो", "पीछे जाओ", "पीछे चलो", "रिवर्स", "पीछे",
+    ],
+    "left": [
+        "turn left", "move left", "go left", "left",
+        "बाएं मुड़ो", "बायें मुड़ो", "बाएं जाओ", "बायें जाओ", "लेफ्ट", "बाएं", "बायें",
+    ],
+    "right": [
+        "turn right", "move right", "go right", "right",
+        "दाएं मुड़ो", "दायें मुड़ो", "दाएं जाओ", "दायें जाओ", "राइट", "दाएं", "दायें",
+    ],
+}
+
+# Flattened (phrase, direction) pairs, longest phrase first so that e.g.
+# "go ahead" is matched before the bare "ahead".
+_DIRECTION_PHRASES: List[Tuple[str, str]] = sorted(
+    (
+        (phrase, direction)
+        for direction, phrases in _DIRECTION_SYNONYMS.items()
+        for phrase in phrases
+    ),
+    key=lambda pair: len(pair[0]),
+    reverse=True,
+)
+
+# Words/phrases that mean "stop moving right now" — checked before
+# movement direction so an in-progress move can always be interrupted.
+_STOP_PHRASES = [
+    "stop moving", "stop robot", "stop", "halt", "freeze",
+    "रुक जाओ", "रुको", "बंद करो", "स्टॉप", "रुक",
+]
+
+# Direction names in the user's language, for spoken replies.
+_DIRECTION_LABELS = {
+    "en": {"front": "front", "back": "back", "left": "left", "right": "right"},
+    "hi": {"front": "आगे", "back": "पीछे", "left": "बाएं", "right": "दाएं"},
+}
+
+# ── Background movement state ──────────────────────────────
+# move() runs on a worker thread so a long movement never blocks the
+# mic/STT loop — the bot can keep listening (and hear a "stop") while
+# it's driving.
+_move_thread: Optional[threading.Thread] = None
+_move_stop_event = threading.Event()
+_move_lock = threading.Lock()
+
+
+def stop() -> None:
+    """Tell the ESP32 to turn all direction outputs off (halt all movement)."""
+    _send_to_esp32(_STOP_COMMAND, 0)
+
+
+def stop_movement() -> None:
+    """
+    Immediately interrupt any in-progress move() call and tell the
+    ESP32 to stop. Safe to call even if nothing is currently moving.
+    """
+    _move_stop_event.set()
+    stop()
+    if _move_thread is not None and _move_thread.is_alive():
+        _move_thread.join(timeout=1.0)
+
+
+def _sleep_interruptible(duration: float) -> None:
+    """Sleep in small steps so _move_stop_event can cut it short."""
+    elapsed = 0.0
+    step = 0.05
+    while elapsed < duration and not _move_stop_event.is_set():
+        time.sleep(min(step, duration - elapsed))
+        elapsed += step
+
+
+def _drive(direction: str, seconds: float, label: str) -> None:
+    """Tell the ESP32 to run one motor for *seconds*, print status, then
+    stop. The ESP32 itself owns the soft-start ramp and auto-stop timer
+    once it gets the command — we just send the single line with the
+    whole-second duration (turns ignore this number on the ESP32 side
+    and always use its own fixed pulse) and sleep here so this call
+    blocks for the same span. The trailing stop() is a safety net in
+    case our sleep and the ESP32's own timer drift apart."""
+    command = _DIRECTION_COMMANDS[direction]
+    _send_to_esp32(command, max(1, round(seconds)))
+    print(f"Moving {label} for {seconds} seconds")
+    _sleep_interruptible(seconds)
+    stop()
+
+
+def _move_worker(direction: str, duration: float) -> None:
+    with _move_lock:
+        _move_stop_event.clear()
+        stop()  # ensure a clean state before driving anything
+
+        if direction in _TURN_DIRECTIONS:
+            # Turn is a short fixed pulse — not user-controlled — then
+            # continue straight ahead for the requested duration.
+            print(f"Turning {direction} for {TURN_PULSE_DURATION} seconds")
+            _drive(direction, TURN_PULSE_DURATION, direction)
+            if _move_stop_event.is_set():
+                return
+            _drive("front", duration, "front")
+        else:
+            _drive(direction, duration, direction)
+
+
+def move(direction: str, duration: float) -> None:
+    """
+    Execute a movement command.
+
+    front/back: drive that pin HIGH for *duration* seconds (capped at
+    MAX_MOVE_DURATION).
+
+    left/right: pivot in that direction for a short fixed pulse
+    (TURN_PULSE_DURATION), then drive front for *duration* seconds
+    (capped at MAX_MOVE_DURATION) — i.e. "turn, then go ahead".
+
+    Runs on a background thread so the caller is not blocked, and any
+    movement already in progress is interrupted first.
+    """
+    global _move_thread
+
+    direction = direction.lower().strip()
+    if direction not in _DIRECTION_COMMANDS:
+        logger.warning("move() called with unknown direction: %s", direction)
+        return
+
+    duration = min(duration, MAX_MOVE_DURATION)
+
+    stop_movement()  # interrupt anything already running first
+
+    _move_thread = threading.Thread(
+        target=_move_worker, args=(direction, duration), daemon=True
+    )
+    _move_thread.start()
+
+
+def extract_direction(text: str) -> Optional[str]:
+    """
+    Return the canonical direction ('front' / 'back' / 'left' / 'right')
+    found in *text*, or None if no direction phrase is present.
+    """
+    lowered = sanitize_text(text).lower()
+    for phrase, direction in _DIRECTION_PHRASES:
+        if phrase in lowered:
+            return direction
+    return None
+
+
+def extract_duration(text: str) -> int:
+    """
+    Return the integer number of seconds found in *text* (e.g. "for 5
+    seconds", "3 sec", "10 seconds"). Defaults to 3 seconds if no
+    duration is specified.
+    """
+    match = re.search(r"\d+", text)
+    if match:
+        return int(match.group())
+    return 3
+
+
+def is_move_command(text: str) -> bool:
+    """Return True if *text* contains a recognized movement direction."""
+    return extract_direction(text) is not None
+
+
+def is_stop_command(text: str) -> bool:
+    """Return True if *text* is asking the robot to stop moving."""
+    lowered = sanitize_text(text).lower()
+    return any(phrase in lowered for phrase in _STOP_PHRASES)
+
+
+def movement_reply(direction: str, duration: float, lang: str) -> str:
+    """
+    Localized, TTS-friendly confirmation for a movement command that
+    was accepted and started, in the user's own language (falls back
+    to English for any lang other than 'hi').
+    """
+    labels = _DIRECTION_LABELS.get(lang, _DIRECTION_LABELS["en"])
+    label = labels[direction]
+
+    if direction in _TURN_DIRECTIONS:
+        if lang == "hi":
+            return (
+                f"ठीक है, पहले {label} मुड़ रहा हूँ, फिर {duration} सेकंड के लिए "
+                f"आगे बढ़ रहा हूँ।"
+            )
+        return f"Turning {direction}, then moving front for {duration} seconds."
+
+    if lang == "hi":
+        return f"ठीक है, {label} की ओर {duration} सेकंड के लिए बढ़ रहा हूँ।"
+    return f"Moving {direction} for {duration} seconds."
+
+
+def stopped_reply(lang: str) -> str:
+    """Localized confirmation that movement was halted."""
+    return "रुक गया।" if lang == "hi" else "Stopped."
+
+
+def duration_limit_reply(direction: str, lang: str) -> str:
+    """
+    User-facing (and TTS-spoken) reply for a movement request that
+    exceeds MAX_MOVE_DURATION. Framed as a deliberate safety policy
+    rather than a system limitation, in the user's own language.
+    """
+    labels = _DIRECTION_LABELS.get(lang, _DIRECTION_LABELS["en"])
+    label = labels[direction]
+
+    if lang == "hi":
+        return (
+            f"सुरक्षा कारणों से, मैं {label} की दिशा में एक बार में अधिकतम "
+            f"{MAX_MOVE_DURATION} सेकंड तक ही जा सकता हूँ। कृपया छोटे-छोटे "
+            f"आदेश एक के बाद एक दें।"
+        )
+    return (
+        f"For safety, I can only move {direction} for up to "
+        f"{MAX_MOVE_DURATION} seconds at a time. "
+        f"Please give me shorter commands, one after another."
+    )
 
 
 @lru_cache(maxsize=4)
@@ -1043,9 +1390,14 @@ _MIC_DEVICE: Optional[str] = resolve_mic_device(MIC_NAME)
 # every time capture_speech() opens a fresh stream.
 _noise_floor: float = ENERGY_THRESHOLD
 
+# Throttles the "MIC DEBUG rms=..." log line to once per second instead
+# of once per audio chunk (which fired ~5x/second at CHUNK_SECS≈0.2s).
+_last_mic_debug_log: float = 0.0
+MIC_DEBUG_LOG_INTERVAL = 1.0  # seconds
+
 
 def capture_speech(timeout: float) -> Optional[np.ndarray]:
-    global _noise_floor
+    global _noise_floor, _last_mic_debug_log
     audio_q   = queue.Queue()
     blocksize = int(SAMPLE_RATE * CHUNK_SECS)
 
@@ -1088,7 +1440,10 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
             if _mic_muted:
                 idle_clock = time.time()
                 continue
-            logger.info("MIC DEBUG rms=%.4f floor=%.4f", rms, _noise_floor)
+            now = time.time()
+            if now - _last_mic_debug_log >= MIC_DEBUG_LOG_INTERVAL:
+                logger.info("MIC DEBUG rms=%.4f floor=%.4f", rms, _noise_floor)
+                _last_mic_debug_log = now
 
             # ── Dynamic threshold: update the ambient noise floor ──
             # Only while NOT recording an utterance — updating during
@@ -1523,6 +1878,22 @@ def _process_query(
         return None
 
     logger.info("User [%s] › %s", lang.upper(), clean)
+
+    # Stop command? Interrupt any in-progress movement immediately,
+    # checked before movement direction so it always takes priority.
+    if is_stop_command(clean):
+        stop_movement()
+        return stopped_reply(lang)
+
+    # Movement command? Handle locally and short-circuit before any
+    # RAG/cache/LLM work — movement never needs the chatbot pipeline.
+    if is_move_command(clean):
+        direction = extract_direction(clean)
+        duration = extract_duration(clean)
+        if duration > MAX_MOVE_DURATION:
+            return duration_limit_reply(direction, lang)
+        move(direction, duration)
+        return movement_reply(direction, duration, lang)
 
     # Change 3 (response cache): skip RAG + the LLM call entirely on a
     # repeated question. Still recorded in conversation history so later
