@@ -27,7 +27,14 @@ SERIAL_PORT = '/dev/serial0'
 BAUD_RATE = 115200
 RECOG_LANGUAGE = 'en-IN'
 SAMPLE_RATE = 16000
-TURN_PULSE = 0.6
+
+# How long (in seconds) the robot pulses its turn motors before moving
+# forward again. 0.6s was too short to complete a real turn - bump this up
+# and tune it against your actual robot until "turn left"/"turn right"
+# rotate roughly 90 degrees. Left/right are split out separately in case
+# your motors aren't perfectly symmetric and need slightly different times.
+LEFT_TURN_PULSE = 1.2
+RIGHT_TURN_PULSE = 1.2
 
 DEFAULT_DURATION = 3
 MAX_DURATION = 5
@@ -226,16 +233,16 @@ def timed_stop(duration, my_flag):
         log.info(f"AUTO STOP after {duration} sec")
 
 
-def turn_then_forward(turn_cmd, total_duration, my_flag):
+def turn_then_forward(turn_cmd, turn_pulse, total_duration, my_flag):
     send_command(turn_cmd)
-    time.sleep(TURN_PULSE)
+    time.sleep(turn_pulse)
 
     if my_flag.is_set():
         return
 
     send_command('w')
 
-    remaining = max(total_duration - TURN_PULSE, 0)
+    remaining = max(total_duration - turn_pulse, 0)
     time.sleep(remaining)
     if not my_flag.is_set():
         send_command('x')
@@ -258,13 +265,13 @@ def process_command(text):
     if matches_any(text, LEFT_WORDS):
         log.info(f"LEFT (turn then forward for {duration}s total)")
         stop_timer_flag = new_flag
-        threading.Thread(target=turn_then_forward, args=('a', duration, new_flag), daemon=True).start()
+        threading.Thread(target=turn_then_forward, args=('d', LEFT_TURN_PULSE, duration, new_flag), daemon=True).start()
         return
 
     if matches_any(text, RIGHT_WORDS):
         log.info(f"RIGHT (turn then forward for {duration}s total)")
         stop_timer_flag = new_flag
-        threading.Thread(target=turn_then_forward, args=('d', duration, new_flag), daemon=True).start()
+        threading.Thread(target=turn_then_forward, args=('a', RIGHT_TURN_PULSE, duration, new_flag), daemon=True).start()
         return
 
     if matches_any(text, FORWARD_WORDS):
