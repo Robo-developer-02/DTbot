@@ -33,8 +33,8 @@ SAMPLE_RATE = 16000
 # and tune it against your actual robot until "turn left"/"turn right"
 # rotate roughly 90 degrees. Left/right are split out separately in case
 # your motors aren't perfectly symmetric and need slightly different times.
-LEFT_TURN_PULSE = 1.2
-RIGHT_TURN_PULSE = 1.2
+LEFT_TURN_PULSE = 5
+RIGHT_TURN_PULSE =  5
 
 DEFAULT_DURATION = 3
 MAX_DURATION = 5
@@ -233,20 +233,18 @@ def timed_stop(duration, my_flag):
         log.info(f"AUTO STOP after {duration} sec")
 
 
-def turn_then_forward(turn_cmd, turn_pulse, total_duration, my_flag):
+def turn_only(turn_cmd, turn_pulse, my_flag):
+    """
+    Turns the robot in place for turn_pulse seconds (a full ~90 degree turn,
+    tuned via LEFT_TURN_PULSE / RIGHT_TURN_PULSE) and then stops. No forward
+    movement afterward, and no dependency on any duration spoken by the user.
+    """
     send_command(turn_cmd)
     time.sleep(turn_pulse)
 
-    if my_flag.is_set():
-        return
-
-    send_command('w')
-
-    remaining = max(total_duration - turn_pulse, 0)
-    time.sleep(remaining)
     if not my_flag.is_set():
         send_command('x')
-        log.info(f"AUTO STOP after turn+forward ({total_duration}s total)")
+        log.info(f"AUTO STOP after turn ({turn_pulse}s)")
 
 
 def process_command(text):
@@ -263,15 +261,15 @@ def process_command(text):
         return
 
     if matches_any(text, LEFT_WORDS):
-        log.info(f"LEFT (turn then forward for {duration}s total)")
+        log.info(f"LEFT (turn only, {LEFT_TURN_PULSE}s, no forward)")
         stop_timer_flag = new_flag
-        threading.Thread(target=turn_then_forward, args=('d', LEFT_TURN_PULSE, duration, new_flag), daemon=True).start()
+        threading.Thread(target=turn_only, args=('a', LEFT_TURN_PULSE, new_flag), daemon=True).start()
         return
 
     if matches_any(text, RIGHT_WORDS):
-        log.info(f"RIGHT (turn then forward for {duration}s total)")
+        log.info(f"RIGHT (turn only, {RIGHT_TURN_PULSE}s, no forward)")
         stop_timer_flag = new_flag
-        threading.Thread(target=turn_then_forward, args=('a', RIGHT_TURN_PULSE, duration, new_flag), daemon=True).start()
+        threading.Thread(target=turn_only, args=('d', RIGHT_TURN_PULSE, new_flag), daemon=True).start()
         return
 
     if matches_any(text, FORWARD_WORDS):
